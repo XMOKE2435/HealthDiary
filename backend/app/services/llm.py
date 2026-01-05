@@ -1,0 +1,817 @@
+import os
+import json
+from typing import Any, Dict, List, Optional
+
+import httpx
+
+
+class QwenClient:
+    def __init__(self) -> None:
+        self.endpoint = os.getenv("QWEN_ENDPOINT", "").strip()
+        self.api_key = os.getenv("QWEN_API_KEY", "").strip()
+        self.model = os.getenv("QWEN_MODEL", "qwen2.5-7b-instruct").strip()
+        self.speech_model = os.getenv("QWEN_SPEECH_MODEL", "").strip() or "qwen2.5-omni-7b"
+        # ASR model for speech-to-text (DashScope uses paraformer models)
+        self.asr_model = os.getenv("QWEN_ASR_MODEL", "paraformer-v2").strip()
+        # Dedicated speech endpoint is required for audio (DashScope native API)
+        self.speech_endpoint = os.getenv("QWEN_SPEECH_ENDPOINT", "").strip()
+
+    async def _post_json(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.endpoint:
+            # Fallback mock if no endpoint configured
+            return {"mock": True}
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(self.endpoint, json=payload, headers=headers)
+            r.raise_for_status()
+            return r.json()
+
+    def _is_openai_compatible(self) -> bool:
+        # crude check for OpenAI-compatible chat endpoint
+        return "chat/completions" in (self.endpoint or "")
+
+    async def _post_speech_form(self, audio_bytes: bytes, mime: str | None, lang: str, file_url: str | None = None) -> Dict[str, Any]:
+        """Send audio to Qwen Omni via compatible-mode chat/completions endpoint with input_audio.
+        
+        Uses the same endpoint as text chat, with audio sent via input_audio in messages.content.
+        Requires streaming (stream=True) as per Qwen Omni requirements.
+        """
+        if not self.endpoint or "chat/completions" not in self.endpoint:
+            raise RuntimeError(
+                "QWEN_ENDPOINT must be the compatible-mode chat/completions endpoint. "
+                "Example: https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
+            )
+        if not self.api_key:
+            raise RuntimeError("QWEN_API_KEY not configured. Please set it to your DashScope API key.")
+        
+        print(f"DEBUG: Transcribing audio via Qwen Omni chat endpoint, model={self.speech_model}, size={len(audio_bytes)} bytes, mime={mime}")
+        
+        import base64
+        fmt = self._audio_format_from_mime(mime)
+        audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+        data_url = f"data:audio/{fmt};base64,{audio_b64}"
+        
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        
+        payload = {
+            "model": self.speech_model or "qwen2.5-omni-7b",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": data_url,
+                                "format": fmt
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": f"Please transcribe this medical consultation audio verbatim in {lang}. Identify different speakers if possible and format as: 'Speaker: text'."
+                        }
+                    ]
+                }
+            ],
+            "modalities": ["text"],
+            "stream": True,
+            "stream_options": {"include_usage": True}
+        }
+        
+        text_chunks: List[str] = []
+        async with httpx.AsyncClient(timeout=None) as client:
+            try:
+                async with client.stream("POST", self.endpoint, headers=headers, json=payload) as resp:
+                    print(f"DEBUG: Stream response status={resp.status_code}")
+                    resp.raise_for_status()
+                    
+                    async for line in resp.aiter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()  # Remove "data: " prefix
+                        if data == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data)
+                            choices = chunk.get("choices", [])
+                            if choices:
+                                delta = choices[0].get("delta", {})
+                                content = delta.get("content", "")
+                                if isinstance(content, str):
+                                    text_chunks.append(content)
+                                elif isinstance(content, list):
+                                    # Handle array format
+                                    for item in content:
+                                        if isinstance(item, dict) and item.get("type") == "text":
+                                            text_chunks.append(item.get("text", ""))
+                                        elif isinstance(item, str):
+                                            text_chunks.append(item)
+                        except json.JSONDecodeError as e:
+                            print(f"DEBUG: Failed to parse chunk: {data[:100]}, error: {e}")
+                            continue
+                
+                transcript = "".join(text_chunks).strip()
+                print(f"DEBUG: Transcription complete, length={len(transcript)} chars")
+                
+                # Try to parse speaker labels if present
+                spans = []
+                if transcript:
+                    # Simple parsing: look for "Speaker: text" patterns
+                    import re
+                    speaker_pattern = r"(\w+):\s*(.+?)(?=\w+:|$)"
+                    matches = re.findall(speaker_pattern, transcript, re.MULTILINE | re.DOTALL)
+                    if matches:
+                        for idx, (speaker, text) in enumerate(matches, 1):
+                            spans.append({
+                                "id": f"s{idx}",
+                                "speaker": speaker.lower() if speaker.lower() in ["doctor", "patient"] else "patient",
+                                "text": text.strip(),
+                                "start_sec": 0.0,
+                                "end_sec": 0.0
+                            })
+                    else:
+                        # No speaker labels, create single span
+                        spans = [{"id": "s1", "speaker": "patient", "text": transcript, "start_sec": 0.0, "end_sec": 0.0}]
+                
+                return {"transcript": transcript, "spans": spans}
+                
+            except httpx.HTTPStatusError as exc:
+                error_text = ""
+                try:
+                    error_text = exc.response.text[:1000]
+                except Exception:
+                    pass
+                error_msg = f"Qwen Omni transcription error {exc.response.status_code}"
+                if error_text:
+                    error_msg += f": {error_text}"
+                print(f"DEBUG: {error_msg}")
+                raise RuntimeError(error_msg) from exc
+            except Exception as exc:
+                print(f"DEBUG: Transcription error: {type(exc).__name__}: {exc}")
+                import traceback
+                print(traceback.format_exc())
+                raise RuntimeError(f"Transcription failed: {exc}") from exc
+    
+    async def _try_native_api(self, endpoint: str, audio_bytes: bytes, mime: str | None, lang: str, file_url: str | None = None) -> Dict[str, Any]:
+        """Use DashScope native ASR API with async pattern.
+        
+        Requires: file_url (publicly accessible URL) - the API doesn't accept base64 data directly.
+        Uses paraformer-v2 model and async task pattern.
+        """
+        if not file_url:
+            raise RuntimeError(
+                "DashScope ASR API requires a publicly accessible file URL (file_urls), not base64 data. "
+                "The audio file must be uploaded to a public URL first."
+            )
+        
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "X-DashScope-Async": "enable"  # Required for async transcription
+        }
+        
+        # DashScope ASR API format - uses paraformer models
+        # Try different model names if paraformer-v2 doesn't work
+        asr_model = self.asr_model or "paraformer-v2"
+        print(f"DEBUG: Using ASR model: {asr_model}")
+        
+        payload = {
+            "model": asr_model,
+            "input": {
+                "file_urls": [file_url]  # Must be publicly accessible URLs
+            }
+        }
+        
+        async with httpx.AsyncClient(timeout=120) as client:
+            # Try to submit transcription task, with fallback to alternative models
+            task_id = None
+            task_result = None
+            models_to_try = [asr_model, "paraformer-realtime-v2", "paraformer-8k-v2", "paraformer-v1", "fun-asr", "sensevoice-v1"]
+            
+            for model_name in models_to_try:
+                try:
+                    test_payload = {"model": model_name, "input": {"file_urls": [file_url]}}
+                    r = await client.post(endpoint, headers=headers, json=test_payload)
+                    print(f"DEBUG: ASR task submission with model '{model_name}': status={r.status_code}")
+                    
+                    if r.status_code == 200:
+                        task_result = r.json()
+                        print(f"DEBUG: Success with model '{model_name}'. Task response: {list(task_result.keys()) if isinstance(task_result, dict) else 'not a dict'}")
+                        
+                        # Extract task_id from response
+                        if isinstance(task_result, dict):
+                            output = task_result.get("output", {})
+                            if isinstance(output, dict):
+                                task_id = output.get("task_id")
+                            # Also check direct task_id
+                            if not task_id:
+                                task_id = task_result.get("task_id") or task_result.get("task", {}).get("task_id")
+                        
+                        if task_id:
+                            print(f"DEBUG: Got task_id={task_id} with model '{model_name}', polling for results...")
+                            break  # Success, exit loop
+                    else:
+                        error_text = r.text[:200] if hasattr(r, 'text') else ""
+                        if "Model not exist" not in error_text:
+                            # Different error, raise it
+                            r.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    error_text = ""
+                    try:
+                        error_text = exc.response.text[:200]
+                    except Exception:
+                        pass
+                    if "Model not exist" in error_text:
+                        print(f"DEBUG: Model '{model_name}' not found, trying next...")
+                        continue  # Try next model
+                    else:
+                        # Different error, re-raise
+                        raise
+            
+            if not task_id:
+                raise RuntimeError(
+                    f"Could not find a valid ASR model. Tried: {models_to_try}\n\n"
+                    "Please set QWEN_ASR_MODEL environment variable to a valid DashScope ASR model name.\n"
+                    "Check your DashScope dashboard for available models in your region."
+                )
+            
+            try:
+                
+                # Step 2: Poll for results (async pattern)
+                import asyncio
+                max_polls = 30  # Max 30 polls
+                poll_interval = 2  # Wait 2 seconds between polls
+                
+                for poll_num in range(max_polls):
+                    await asyncio.sleep(poll_interval)
+                    
+                    # Query task status - DashScope uses /tasks/{task_id} endpoint
+                    status_headers = {"Authorization": f"Bearer {self.api_key}"}
+                    # Construct status endpoint: replace /transcription with /tasks/{task_id}
+                    base_url = endpoint.rsplit("/transcription", 1)[0] if "/transcription" in endpoint else endpoint.rsplit("/", 1)[0]
+                    status_url = f"{base_url}/tasks/{task_id}"
+                    status_r = await client.get(status_url, headers=status_headers)
+                    status_r.raise_for_status()
+                    status_data = status_r.json()
+                    
+                    print(f"DEBUG: Poll {poll_num + 1}: status={status_data.get('output', {}).get('task_status', 'unknown')}")
+                    
+                    output = status_data.get("output", {})
+                    task_status = output.get("task_status", "").lower()
+                    
+                    if task_status == "succeeded":
+                        # Transcription complete
+                        result = output.get("result", {})
+                        sentences = result.get("sentences", [])
+                        transcript = result.get("text") or ""
+                        
+                        # Build spans from sentences
+                        spans = []
+                        for idx, sent in enumerate(sentences, 1):
+                            if isinstance(sent, dict):
+                                spans.append({
+                                    "id": f"s{idx}",
+                                    "speaker": sent.get("speaker", "patient"),
+                                    "text": sent.get("text", ""),
+                                    "start_sec": sent.get("start", sent.get("start_time", 0.0)),
+                                    "end_sec": sent.get("end", sent.get("end_time", sent.get("start", 0.0)))
+                                })
+                        
+                        if not spans and transcript:
+                            spans = [{"id": "s1", "speaker": "patient", "text": transcript, "start_sec": 0.0, "end_sec": 0.0}]
+                        
+                        return {"transcript": transcript, "spans": spans}
+                    elif task_status in ["failed", "canceled"]:
+                        error_msg = output.get("error_message", "Transcription task failed")
+                        raise RuntimeError(f"Transcription task {task_status}: {error_msg}")
+                    # Otherwise, continue polling (task_status is "pending" or "running")
+                
+                # If we get here, polling timed out
+                raise RuntimeError(f"Transcription task timed out after {max_polls * poll_interval} seconds. Task ID: {task_id}")
+                
+            except httpx.HTTPStatusError as exc:
+                error_text = ""
+                try:
+                    error_text = exc.response.text[:1000]
+                except Exception:
+                    pass
+                error_msg = f"DashScope ASR API error {exc.response.status_code}"
+                if error_text:
+                    error_msg += f": {error_text}"
+                print(f"DEBUG: {error_msg}")
+                raise RuntimeError(error_msg) from exc
+            except Exception as exc:
+                print(f"DEBUG: ASR API error: {type(exc).__name__}: {exc}")
+                import traceback
+                print(traceback.format_exc())
+                raise RuntimeError(f"ASR API request failed: {exc}") from exc
+
+    async def _post_chat(self, messages: List[Dict[str, str]], response_format: str | None = None, model: str | None = None) -> str:
+        """Send chat-style messages and return assistant content string.
+        Supports OpenAI-compatible schema used by DashScope compatible-mode.
+        """
+        if not self.endpoint:
+            return ""
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        if self._is_openai_compatible():
+            model_name = model or self.model or "qwen2.5-7b-instruct"
+            payload: Dict[str, Any] = {
+                "model": model_name,
+                "messages": messages,
+                "temperature": 0.2,
+            }
+            if response_format:
+                # some providers accept {"type":"json_object"}
+                payload["response_format"] = {"type": response_format}
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post(self.endpoint, headers=headers, json=payload)
+                r.raise_for_status()
+                data = r.json()
+                try:
+                    return data["choices"][0]["message"]["content"].strip()
+                except Exception:
+                    return json.dumps(data)
+        else:
+            # Fallback to simple input schema
+            data = await self._post_json({"input": "\n".join([f"{m['role']}: {m['content']}" for m in messages])})
+            if isinstance(data, dict):
+                for key in ("text", "output", "response"):
+                    if key in data and isinstance(data[key], str):
+                        return data[key].strip()
+            if isinstance(data, str):
+                return data.strip()
+            return ""
+
+    async def nlu_slot_fill(self, text: str) -> Dict[str, Any]:
+        if not self.endpoint:
+            # Heuristic mock for demo
+            fields: Dict[str, Any] = {"symptom_label": None, "severity": None}
+            t = text.lower()
+            if "after" in t and "lunch" in t:
+                fields["timing"] = "post-meal"
+            if "after" in t and ("meal" in t or "eat" in t or "eating" in t):
+                fields["timing"] = "post-meal"
+            if any(k in t for k in ["stomach", "abdominal", "belly", "tummy"]):
+                fields["symptom_label"] = "abdominal pain"
+            if any(k in t for k in ["headache", "migraine", "head pain"]):
+                fields["symptom_label"] = fields.get("symptom_label") or "headache"
+            for num in range(10, -1, -1):
+                if f" {num} " in f" {t} ":
+                    fields["severity"] = num
+                    break
+            # Parse "mala" or spicy as trigger
+            if "mala" in t or "spicy" in t or "chili" in t:
+                fields.setdefault("triggers", [])
+                if "spicy" not in fields["triggers"]:
+                    fields["triggers"].append("spicy")
+            # Parse fever and temperature
+            if "fever" in t or "degree" in t or "degrees" in t:
+                fields.setdefault("associated", [])
+                if "fever" not in fields["associated"]:
+                    fields["associated"].append("fever")
+                # extract temperature like '39' near 'degree'
+                import re
+                m = re.search(r"(\d{2}(?:\.\d)?)\s*degree", t)
+                if m:
+                    try:
+                        fields["fever_temp_c"] = float(m.group(1))
+                    except Exception:
+                        pass
+            # Parse bowel changes
+            bt = t.replace("bowel", "bowel ")  # ensure token separation
+            if any(word in bt for word in ["diarrhea", "diarrhoea", "constipation", "blood in stool", "bloody stool", "blood in the stool"]):
+                fields.setdefault("associated", [])
+                for w in ["diarrhea", "constipation", "blood in stool"]:
+                    if w.split()[0] in bt and w not in fields["associated"]:
+                        fields["associated"].append(w)
+                fields["bowel_changes"] = "present"
+            elif ("no change" in t or "no changes" in t or "no change in habit" in t) and ("bowel" in t or "habit" in t):
+                fields["bowel_changes"] = "none"
+            return {"fields": fields, "provenance": {"nlu": True}}
+        # Use chat completion to request strict JSON
+        system = {
+            "role": "system",
+            "content": (
+                "You extract health intake fields in strict JSON. Only output a compact JSON object with keys: "
+                "symptom_label, onset, location, duration, character, aggravating, relieving, timing, "
+                "severity (0-10), associated, triggers. Use null or empty list when unknown. No extra text."
+            ),
+        }
+        user = {"role": "user", "content": f"Text: {text}"}
+        content = await self._post_chat([system, user], response_format="json_object")
+        try:
+            obj = json.loads(content)
+            return {"fields": obj, "provenance": {"nlu": True}}
+        except Exception:
+            # if provider returned plain text, fallback to empty
+            return {"fields": {}, "provenance": {"nlu": True}}
+
+    async def clarifier_select(self, fields: Dict[str, Any], pathway: str) -> List[str]:
+        # Whitelisted clarifiers per pathway (demo subset)
+        whitelist: Dict[str, List[str]] = {
+            "abdominal_pain": [
+                "clarifier.meal_relation",
+                "clarifier.fever",
+                "clarifier.bowel_changes",
+            ],
+            "sleep": ["clarifier.sleep_duration", "clarifier.sleep_quality"],
+            "medication": ["clarifier.missed_dose", "clarifier.side_effects"],
+            "meal": ["clarifier.meal_time", "clarifier.meal_composition"],
+        }
+        allowed = whitelist.get(pathway, [])
+        if not self.endpoint:
+            # Simple rule: pick first two missing-related clarifiers
+            return allowed[:2]
+
+        prompt = (
+            "Given current fields and a pathway, return up to two clarifier IDs from a whitelist only. "
+            f"Whitelist: {allowed}. Fields: {fields}. Pathway: {pathway}. Output JSON array of strings."
+        )
+        resp = await self._post_json({"input": prompt})
+        # Expect array of strings, but guard in case
+        if isinstance(resp, list):
+            return [c for c in resp if c in allowed][:2]
+        return allowed[:2]
+
+    async def generate_question(self, missing_field_ids: List[str], fields: Dict[str, Any], messages: List[Dict[str, str]]) -> str:
+        """Return ONE short, natural-language question targeting the highest-priority missing field.
+        Requires LLM endpoint; will raise if unavailable so caller can handle.
+        """
+        if not missing_field_ids:
+            return ""
+        if not self.endpoint:
+            raise RuntimeError("LLM endpoint not configured")
+        target = missing_field_ids[0]
+
+        # Build a compact chat with system + conversation
+        sys = {
+            "role": "system",
+            "content": (
+                "You are a gentle, compassionate health intake assistant who deeply cares about patients' wellbeing. "
+                "Your role is to collect symptom information with empathy, patience, and understanding.\n\n"
+                "CRITICAL: Read the user's emotional tone from their messages. Detect if they are:\n"
+                "- In pain or distress: Show genuine sympathy and care. Acknowledge their discomfort first.\n"
+                "- Angry or frustrated: Be calm, understanding, and apologetic. Validate their feelings.\n"
+                "- Impatient or rushed: Be brief, efficient, and reassuring. Acknowledge their time concerns.\n"
+                "- Anxious or worried: Be gentle, supportive, and calming. Reassure them you're here to help.\n\n"
+                "Response format:\n"
+                "1. FIRST: Acknowledge their emotional state with genuine empathy (2-8 words). Examples:\n"
+                "   - If in pain: 'I'm sorry you're experiencing this pain. Let me help you.'\n"
+                "   - If angry: 'I understand this is frustrating. I'm here to help make this easier.'\n"
+                "   - If impatient: 'I'll keep this quick. Just one more question.'\n"
+                "   - If anxious: 'I understand this is worrying. We'll get through this together.'\n"
+                "2. THEN: Ask ONE concise, concrete follow-up question (<= 12 words) to collect missing information.\n\n"
+                "Rules:\n"
+                "- Always show sympathy and care, especially when pain is mentioned\n"
+                "- Match your tone to their emotional state - be gentler when they're distressed\n"
+                "- Use warm, supportive language ('I understand', 'I'm here to help', 'Let's work through this')\n"
+                "- No diagnosis or medication advice\n"
+                "- Prefer yes/no or simple number questions\n"
+                "- Avoid vague or speculative questions\n"
+                "- If user seems unrelated, gently redirect: 'I want to make sure I understand your symptoms correctly. [question]'"
+            ),
+        }
+        conv_msgs = [{"role": m.get("role", "user"), "content": m.get("text", "")} for m in messages[-6:]]
+        hint = {
+            "role": "system",
+            "content": f"Missing clarifier IDs: {missing_field_ids}. Known fields: {json.dumps(fields, ensure_ascii=False)}",
+        }
+        content = await self._post_chat([sys, hint] + conv_msgs)
+        return content or "Could you tell me a bit more?"
+
+    async def recommend_from_entries(self, entries: List[Dict[str, Any]], window_days: int) -> List[Dict[str, Any]]:
+        """Analyze past entries and return non-medical recommendations with evidence pointers.
+        Uses LLM to interpret patterns if endpoint available; otherwise heuristic fallback.
+        """
+        if not entries:
+            return []
+        if not self.endpoint:
+            # Fallback: simple rule-based
+            suggestions = []
+            last = entries[-1]
+            last_id = last.get("id")
+            fields = last.get("fields", {}) or {}
+            if fields.get("severity") and fields.get("severity") >= 7:
+                suggestions.append({
+                    "text": "Your recent entries show higher severity. Consider preparing a Doctor Pack.",
+                    "evidence": [f"entry_id:{last_id}", "feature:severity_high"]
+                })
+            return suggestions if suggestions else [{"text": "Continue monitoring symptoms.", "evidence": [f"entry_id:{last_id}"]}]
+
+        # Build a detailed summary of entries for LLM analysis
+        summary_lines = []
+        for e in entries[-50:]:
+            fields = e.get('fields') or {}
+            ts = e.get('ts', '')[:10]
+            label = fields.get('symptom_label', '')
+            raw = e.get('symptom_raw', '')[:80]
+            sev = fields.get('severity')
+            timing = fields.get('timing')
+            triggers = fields.get('triggers') or []
+            assoc = fields.get('associated') or []
+            summary_lines.append(f"{ts} | {label} | {raw} | severity={sev} | timing={timing} | triggers={','.join(triggers)} | associated={','.join(assoc)} | id={e.get('id','')}")
+        labels = [((e.get('fields') or {}).get('symptom_label') or '').lower() for e in entries]
+        top_labels = [l for l in {l for l in labels if l}]
+        entry_text = "\n".join(summary_lines)
+        sys = {
+            "role": "system",
+            "content": (
+                "You analyze patient diary entries and produce detailed, professional non-medical recommendations. Output strict JSON array (3-5 items), each object: "
+                '{"text": "detailed recommendation paragraph (2-3 sentences explaining what to do, why based on patterns, and how to track)", "evidence": ["entry_id:..."]}. '
+                "Rules: no diagnosis or medication advice; be detailed and professional; tailor to symptom categories observed; "
+                "explain patterns (frequency, timing, triggers, severity trends); provide actionable next steps; "
+                "always include at least one evidence token entry_id:* from provided entries; avoid generic one-liners; use clear, patient-friendly language."
+            ),
+        }
+        user = {
+            "role": "user",
+            "content": (
+                f"Analyze the last {window_days} days of entries with detailed information:\n"
+                f"Symptom categories observed: {', '.join(top_labels) or 'n/a'}.\n"
+                f"Total entries: {len(entries)}.\n"
+                f"Detailed entries:\n{entry_text}\n\n"
+                "Return a JSON array of 3-5 detailed, professional recommendations. Each recommendation should be 2-3 sentences explaining what to monitor/track, why (based on patterns observed), and how to do it."
+            ),
+        }
+        content = await self._post_chat([sys, user], response_format="json_object")
+        try:
+            obj = json.loads(content)
+            if isinstance(obj, list):
+                # sanitize evidence
+                valid_ids = {e.get('id') for e in entries}
+                for s in obj:
+                    ev = [tok for tok in (s.get('evidence') or []) if isinstance(tok, str) and tok.startswith('entry_id:') and (tok.split(':',1)[1] in valid_ids)]
+                    if not ev and entries:
+                        ev = [f"entry_id:{entries[-1].get('id')}"]
+                    s['evidence'] = ev
+                return obj
+            if isinstance(obj, dict) and "suggestions" in obj:
+                valid_ids = {e.get('id') for e in entries}
+                out = []
+                for s in obj["suggestions"]:
+                    ev = [tok for tok in (s.get('evidence') or []) if isinstance(tok, str) and tok.startswith('entry_id:') and (tok.split(':',1)[1] in valid_ids)]
+                    if not ev and entries:
+                        ev = [f"entry_id:{entries[-1].get('id')}"]
+                    s['evidence'] = ev
+                    out.append(s)
+                return out
+        except Exception:
+            pass
+        # Fallback
+        return [{"text": "Continue monitoring symptoms.", "evidence": [f"entry_id:{entries[-1].get('id')}"]}]
+
+    async def summarize_doctor_pack(self, entries: List[Dict[str, Any]], window_days: int) -> Dict[str, Any]:
+        """Create a patient-oriented summary grouped by symptom, with dates and summaries.
+        Returns JSON: {symptom_groups:[{symptom_label, dates[], summary, evidence[]}], suggestions:[{text,evidence[]}]}.
+        """
+        if not entries:
+            return {"symptom_groups": [], "suggestions": []}
+        
+        # Pre-group entries by symptom_label and extract dates directly from entries
+        groups_by_label = {}
+        for e in entries:
+            fields = e.get("fields", {}) or {}
+            label = (fields.get("symptom_label") or "symptom").lower()
+            if label not in groups_by_label:
+                groups_by_label[label] = {"dates": [], "entry_ids": []}
+            date_str = (e.get("ts", "") or "")[:10]
+            if date_str and date_str not in groups_by_label[label]["dates"]:
+                groups_by_label[label]["dates"].append(date_str)
+            groups_by_label[label]["entry_ids"].append(e.get("id"))
+        
+        if not self.endpoint:
+            # Heuristic: use pre-grouped data
+            out = []
+            for label, data in groups_by_label.items():
+                out.append({
+                    "symptom_label": label,
+                    "dates": sorted(data["dates"]),
+                    "summary": f"Reported {len(data['entry_ids'])} times",
+                    "evidence": [f"entry_id:{eid}" for eid in data["entry_ids"][:5]]
+                })
+            sugg = await self.recommend_from_entries(entries, window_days)
+            return {"symptom_groups": out, "suggestions": sugg}
+
+        # Build context with labels, dates, and key fields for LLM summary generation
+        lines = []
+        for e in entries[-50:]:
+            fields = e.get("fields", {}) or {}
+            label = fields.get("symptom_label") or "symptom"
+            ts = e.get("ts", "")[:10]
+            raw = e.get("symptom_raw", "")[:60]
+            sev = fields.get("severity")
+            timing = fields.get("timing")
+            triggers = fields.get("triggers") or []
+            lines.append(f"{ts} | {label} | {raw} | sev={sev} timing={timing} triggers={','.join(triggers)} | id={e.get('id','')}")
+        ctx = "\n".join(lines)
+        sys = {
+            "role": "system",
+            "content": (
+                "You create a patient-friendly summary grouped by symptom type to help them answer doctors' questions. Output strict JSON with: "
+                "symptom_groups:[{symptom_label (string), summary (one clear sentence describing pattern/timing/triggers/severity), evidence[]}], "
+                "suggestions:[{text,evidence[]}]. "
+                "Rules: group entries by symptom_label; provide a clear summary sentence for each symptom group; "
+                "use simple language (CEFR B1); no diagnosis or medication advice; each item MUST include ONLY evidence tokens entry_id:* from provided entries; "
+                "do NOT include dates in the response - dates will be added separately."
+            ),
+        }
+        user = {"role": "user", "content": f"Entries (last {window_days} days) with dates, labels, and ids:\n{ctx}\nReturn JSON only (no dates field in symptom_groups)."}
+        content = await self._post_chat([sys, user], response_format="json_object")
+        try:
+            obj = json.loads(content)
+            if isinstance(obj, dict):
+                obj.setdefault("symptom_groups", [])
+                obj.setdefault("suggestions", [])
+                valid_ids = {e.get('id') for e in entries}
+                def sanitize_evidence(ev):
+                    ev = ev or []
+                    out = [tok for tok in ev if isinstance(tok, str) and tok.startswith('entry_id:') and (tok.split(':',1)[1] in valid_ids)]
+                    return out
+                # Merge LLM summaries with actual dates from entries
+                final_groups = []
+                for g in obj.get('symptom_groups', []):
+                    label = (g.get("symptom_label") or "symptom").lower()
+                    if label in groups_by_label:
+                        final_groups.append({
+                            "symptom_label": label,
+                            "dates": sorted(groups_by_label[label]["dates"]),
+                            "summary": g.get("summary", ""),
+                            "evidence": sanitize_evidence(g.get("evidence")) or [f"entry_id:{eid}" for eid in groups_by_label[label]["entry_ids"][:5]]
+                        })
+                # If LLM didn't return groups, use pre-grouped data with heuristic summaries
+                if not final_groups:
+                    for label, data in groups_by_label.items():
+                        final_groups.append({
+                            "symptom_label": label,
+                            "dates": sorted(data["dates"]),
+                            "summary": f"Reported {len(data['entry_ids'])} times",
+                            "evidence": [f"entry_id:{eid}" for eid in data["entry_ids"][:5]]
+                        })
+                for s in obj.get('suggestions', []):
+                    ev = sanitize_evidence(s.get('evidence'))
+                    if not ev and entries:
+                        ev = [f"entry_id:{entries[-1].get('id')}"]
+                    s['evidence'] = ev
+                return {"symptom_groups": final_groups, "suggestions": obj.get("suggestions", [])}
+        except Exception:
+            pass
+        # Fallback: use pre-grouped data
+        out = []
+        for label, data in groups_by_label.items():
+            out.append({
+                "symptom_label": label,
+                "dates": sorted(data["dates"]),
+                "summary": f"Reported {len(data['entry_ids'])} times",
+                "evidence": [f"entry_id:{eid}" for eid in data["entry_ids"][:5]]
+            })
+        return {"symptom_groups": out, "suggestions": []}
+
+    async def summarize_entry(self, entry: Dict[str, Any]) -> str:
+        """Summarize a single diary entry into a brief, doctor-friendly sentence.
+        Prefer structured fields; use messages (if present in provenance) as context. Do not quote user wording.
+        """
+        fields = entry.get("fields", {}) or {}
+        raw = entry.get("symptom_raw", "")
+        provenance = entry.get("provenance") or {}
+        messages = provenance.get("messages") or []
+        if not self.endpoint:
+            parts = []
+            if fields.get("symptom_label"):
+                parts.append(fields.get("symptom_label"))
+            elif raw:
+                parts.append(raw)
+            if fields.get("severity") is not None:
+                parts.append(f"severity {fields.get('severity')}/10")
+            if fields.get("timing"):
+                parts.append(f"{fields.get('timing')}")
+            if fields.get("triggers"):
+                parts.append(f"triggers: {', '.join(fields.get('triggers', []))}")
+            if fields.get("fever_temp_c"):
+                parts.append(f"fever {fields.get('fever_temp_c')}°C")
+            return "; ".join(parts) if parts else (raw or "Symptom reported")
+
+        sys = {
+            "role": "system",
+            "content": (
+                "You summarize a patient diary entry into ONE concise sentence for a doctor. "
+                "Do not quote user wording; paraphrase clinically. Include symptom, severity if given, timing/triggers if relevant, associated symptoms if notable. "
+                "Keep it brief (<= 20 words); no diagnosis or medication advice; natural language; avoid Q&A phrasing."
+            ),
+        }
+        user_data = {
+            "fields": fields,
+            "context_messages": messages[:6],
+        }
+        user = {"role": "user", "content": f"Summarize this entry from fields and context: {json.dumps(user_data, ensure_ascii=False)}"}
+        content = await self._post_chat([sys, user])
+        return content.strip() or (fields.get("symptom_label") or raw or "Symptom reported")
+
+    # --- Visit transcription & summary ---
+
+    def _audio_format_from_mime(self, mime: Optional[str]) -> str:
+        mime = (mime or "").lower()
+        if "webm" in mime:
+            return "webm"
+        if "ogg" in mime:
+            return "ogg"
+        if "mp3" in mime:
+            return "mp3"
+        if "m4a" in mime or "aac" in mime:
+            return "m4a"
+        return "wav"
+
+    async def transcribe_audio(self, audio_bytes: bytes, lang: str = "en", mime: Optional[str] = None, file_url: Optional[str] = None) -> Dict[str, Any]:
+        """Send audio bytes to Qwen Omni speech endpoint for transcription with speaker tags."""
+        if not audio_bytes:
+            raise ValueError("audio_bytes required")
+        data = await self._post_speech_form(audio_bytes, mime, lang, file_url)
+        transcript = data.get("text") or data.get("transcript") or ""
+        segments = data.get("segments") or data.get("spans") or []
+        spans: List[Dict[str, Any]] = []
+        if isinstance(segments, list) and segments:
+            for idx, seg in enumerate(segments, start=1):
+                spans.append({
+                    "id": seg.get("id") or seg.get("segment_id") or f"s{idx}",
+                    "speaker": (seg.get("speaker") or seg.get("role") or "patient").lower()[:20] or "patient",
+                    "start": seg.get("start_sec") or seg.get("start") or seg.get("start_time") or 0.0,
+                    "end": seg.get("end_sec") or seg.get("end") or seg.get("end_time") or seg.get("start_sec") or 0.0,
+                    "text": seg.get("text") or seg.get("sentence") or "",
+                })
+        else:
+            spans = [{"id": "s1", "speaker": "patient", "start": 0.0, "end": 0.0, "text": transcript or ""}]
+        # Ensure defaults
+        for idx, span in enumerate(spans, start=1):
+            span.setdefault("id", f"s{idx}")
+            span.setdefault("speaker", "patient")
+            span.setdefault("start", 0.0)
+            span.setdefault("end", span.get("start", 0.0))
+            span.setdefault("text", "")
+        return {
+            "transcript": transcript or "\n".join(s.get("text", "") for s in spans if s.get("text")),
+            "spans": spans,
+        }
+
+    async def summarize_visit(self, transcript: str, spans: List[Dict[str, Any]], lang: str = "en") -> Dict[str, Any]:
+        """Summarize a visit transcript emphasizing doctor instructions."""
+        if not transcript:
+            return {"summary_md": "No transcript available.", "action_items": [], "provenance": []}
+        if not self.endpoint:
+            return {
+                "summary_md": "- Doctor asked patient to keep a daily symptom diary.\n- Patient acknowledged and agreed to follow instructions.",
+                "action_items": [
+                    {"text": "Log symptoms daily with timing and triggers.", "source_span_id": "s1"},
+                    {"text": "Share diary with doctor during next visit.", "source_span_id": "s2"},
+                ],
+                "provenance": spans or [],
+            }
+        sys = {
+            "role": "system",
+            "content": (
+                "You are a clinical assistant who summarizes doctor visits for patients. "
+                "Produce JSON with fields: summary_md (markdown bullet list highlighting doctor instructions, follow-ups, meds), "
+                "action_items (array of {text, source_span_id}), and provenance (array of {speaker, text, source_span_id}). "
+                "Focus on what the doctor said, next steps, monitoring instructions, dosing reminders. "
+                "Use patient-friendly language (CEFR B1), no diagnosis beyond transcript."
+            ),
+        }
+        payload = {
+            "transcript": transcript,
+            "spans": spans,
+            "lang": lang,
+        }
+        user = {"role": "user", "content": f"Summarize this visit:\n{json.dumps(payload, ensure_ascii=False)}"}
+        content = await self._post_chat([sys, user], response_format="json_object")
+        try:
+            data = json.loads(content)
+        except Exception:
+            data = {}
+        summary = data.get("summary_md") if isinstance(data, dict) else None
+        action_items = data.get("action_items") if isinstance(data, dict) else []
+        provenance = data.get("provenance") if isinstance(data, dict) else []
+        # Sanitize action items
+        clean_actions = []
+        for item in action_items or []:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if not text:
+                continue
+            clean_actions.append({"text": text, "source_span_id": item.get("source_span_id")})
+        clean_prov = []
+        for span in provenance or spans or []:
+            if isinstance(span, dict):
+                clean_prov.append({
+                    "speaker": span.get("speaker", "doctor"),
+                    "text": span.get("text", ""),
+                    "source_span_id": span.get("id") or span.get("source_span_id"),
+                })
+        return {
+            "summary_md": summary or "- Unable to summarize the visit.",
+            "action_items": clean_actions,
+            "provenance": clean_prov,
+        }
+
+
