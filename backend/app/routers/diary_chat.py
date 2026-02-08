@@ -130,8 +130,15 @@ async def diary_chat_step(req: ChatStepRequest):
     clarifiers = []
     if need:
         target = need[0]
-        # Use LLM to generate natural phrasing; error if unavailable
-        q_text = await llm.generate_question([target], merged, [m.model_dump() for m in req.messages])
+        # Use LLM to generate natural phrasing; if LLM is not configured, return a clear error
+        try:
+            q_text = await llm.generate_question([target], merged, [m.model_dump() for m in req.messages])
+        except Exception as exc:
+            # Surface a clear error instead of silent fallback so callers know to configure the LLM
+            raise HTTPException(
+                status_code=503,
+                detail="LLM not configured. Please set QWEN_ENDPOINT and QWEN_API_KEY, then restart the server."
+            ) from exc
         clarifiers = [{"id": target, "question": q_text}]
 
     # Heuristic completeness: ready when we have a label and severity

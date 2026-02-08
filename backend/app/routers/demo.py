@@ -123,15 +123,22 @@ def demo_home(request: Request):
           </style>
         </head>
         <body>
-          <header>
-            <h1>HealthDiary MVP Demo</h1>
-            <p>Interactive symptom intake, detailed recommendations, and patient-ready visit preparation.</p>
+          <header style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;">
+            <div>
+              <h1 id="titleText">HealthDiary MVP Demo</h1>
+              <p id="subtitleText">Interactive symptom intake, detailed recommendations, and patient-ready visit preparation.</p>
+            </div>
+            <div>
+              <button class="secondary" id="langToggleBtn" onclick="toggleLanguageMode()" style="background:rgba(15,23,42,0.12);color:#fff;border:1px solid rgba(255,255,255,0.4);">
+                🌐 Language / 语言
+              </button>
+            </div>
           </header>
           <main>
           <div class="row">
             <div class="col">
               <div class="card">
-                <h3>1) Symptom Entry (LLM chat → single saved entry)</h3>
+                <h3 id="card1Title">1) Symptom Entry (LLM chat → single saved entry)</h3>
                 <label>User ID</label>
                 <input id="userId" value="demo-user-1"/>
                 <div style="display:flex; gap:8px;">
@@ -152,19 +159,20 @@ def demo_home(request: Request):
                   <button class="secondary" id="voiceBtn" style="display:flex;align-items:center;gap:6px;" onclick="toggleVoice()">
                     <span id="voiceIcon">🎙️</span><span id="voiceLabel">Voice Input</span>
                   </button>
+                  <button class="secondary" id="ttsBtn" onclick="toggleTts()">🔊 Voice On</button>
                 </div>
                 <small>Tip: The assistant asks one concise follow-up per turn; once enough info is collected, it auto-saves. You can type or use voice capture.</small>
                 <pre id="diaryOut"></pre>
               </div>
 
               <div class="card">
-                <h3>2) GET /recommendations</h3>
+                <h3 id="card2Title">2) GET /recommendations</h3>
                 <button onclick="getRecs()">Fetch Recommendations</button>
                 <pre id="recsOut"></pre>
               </div>
 
               <div class="card">
-                <h3>3) POST /doctor-pack</h3>
+                <h3 id="card3Title">3) POST /doctor-pack</h3>
                 <button onclick="doctorPack()">Generate Doctor Pack</button>
                 <div id="packLinks"></div>
               </div>
@@ -172,7 +180,7 @@ def demo_home(request: Request):
 
             <div class="col">
               <div class="card">
-                <h3>4) Visit Capture (record + summary)</h3>
+                <h3 id="card4Title">4) Visit Capture (record + summary)</h3>
                 <div class="record-status" id="recordStatus">Microphone idle</div>
                 <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;">
                   <button id="recordBtn" onclick="startRecording()">Start Recording</button>
@@ -195,8 +203,115 @@ def demo_home(request: Request):
           <script>
             // Unified Symptom Chat → single entry
             window._chat = { messages: [], fields: {}, ready:false };
+            // Text-to-speech playback for assistant replies
+            window._tts = {
+              supported: typeof window !== 'undefined' && 'speechSynthesis' in window && typeof SpeechSynthesisUtterance !== 'undefined',
+              enabled: true
+            };
             // Visit capture state
             window._visitState = { recorder:null, chunks:[], stream:null, transcript:'', spans:[], summary:null, showTranscript:false, recordedBlob:null };
+            // Language mode state
+            window._langMode = 'ENGLISH';
+            window._langCode = 'en';
+
+            async function loadLanguageMode(){
+              try{
+                const r = await fetch('/language-mode');
+                if(!r.ok) return;
+                const j = await r.json();
+                window._langMode = (j.mode_name || j.mode || 'ENGLISH').toUpperCase();
+                applyLanguageToUI();
+              }catch(e){
+                console.warn('Failed to load language mode', e);
+              }
+            }
+
+            function applyLanguageToUI(){
+              const mode = window._langMode || 'ENGLISH';
+              window._langCode = mode === 'CHINESE' ? 'zh' : 'en';
+              const title = document.getElementById('titleText');
+              const subtitle = document.getElementById('subtitleText');
+              const card1 = document.getElementById('card1Title');
+              const card2 = document.getElementById('card2Title');
+              const card3 = document.getElementById('card3Title');
+              const card4 = document.getElementById('card4Title');
+              const langBtn = document.getElementById('langToggleBtn');
+              if(mode === 'CHINESE'){
+                if(title) title.textContent = 'HealthDiary 示例（双语版）';
+                if(subtitle) subtitle.textContent = '记录症状、获取生活建议，并为就诊提前做好准备。';
+                if(card1) card1.textContent = '1）症状记录（聊天方式 → 自动保存一条记录）';
+                if(card2) card2.textContent = '2）获取生活方式建议（GET /recommendations）';
+                if(card3) card3.textContent = '3）生成就诊摘要（POST /doctor-pack）';
+                if(card4) card4.textContent = '4）门诊录音与总结（语音转写 + 嘱托摘要）';
+                if(langBtn) langBtn.textContent = '🌐 当前：中文（点击切换 English）';
+              }else{
+                if(title) title.textContent = 'HealthDiary MVP Demo';
+                if(subtitle) subtitle.textContent = 'Interactive symptom intake, detailed recommendations, and patient-ready visit preparation.';
+                if(card1) card1.textContent = '1) Symptom Entry (LLM chat → single saved entry)';
+                if(card2) card2.textContent = '2) GET /recommendations';
+                if(card3) card3.textContent = '3) POST /doctor-pack';
+                if(card4) card4.textContent = '4) Visit Capture (record + summary)';
+                if(langBtn) langBtn.textContent = '🌐 Language / 语言';
+              }
+            }
+
+            async function toggleLanguageMode(){
+              const current = window._langMode || 'ENGLISH';
+              const next = current === 'CHINESE' ? 'ENGLISH' : 'CHINESE';
+              try{
+                const r = await fetch('/language-mode', {
+                  method: 'POST',
+                  headers: {'Content-Type':'application/json'},
+                  body: JSON.stringify({mode: next})
+                });
+                if(r.ok){
+                  const j = await r.json();
+                  window._langMode = (j.mode_name || j.mode || next).toUpperCase();
+                  applyLanguageToUI();
+                }else{
+                  alert('Failed to switch language mode.');
+                }
+              }catch(e){
+                console.error('Language toggle error', e);
+                alert('Unable to switch language mode.');
+              }
+            }
+            function updateTtsUI(){
+              const btn = document.getElementById('ttsBtn');
+              if(!btn) return;
+              if(!window._tts.supported){
+                btn.textContent = '🔈 Voice not supported';
+                btn.disabled = true;
+                btn.style.opacity = 0.6;
+                return;
+              }
+              btn.textContent = window._tts.enabled ? '🔊 Voice On' : '🔇 Voice Off';
+              btn.style.opacity = window._tts.enabled ? 1 : 0.65;
+            }
+            function toggleTts(){
+              if(!window._tts.supported){
+                alert('Voice playback is not supported in this browser.');
+                updateTtsUI();
+                return;
+              }
+              window._tts.enabled = !window._tts.enabled;
+              if(!window._tts.enabled && window.speechSynthesis){
+                window.speechSynthesis.cancel();
+              }
+              updateTtsUI();
+            }
+            function speak(text){
+              if(!text || !window._tts.supported || !window._tts.enabled) return;
+              try{
+                const utter = new SpeechSynthesisUtterance(text);
+                utter.lang = (window._langCode === 'zh') ? 'zh-CN' : 'en-US';
+                utter.rate = 1;
+                window.speechSynthesis.cancel();
+                window.speechSynthesis.speak(utter);
+              }catch(err){
+                console.warn('TTS error', err);
+              }
+            }
             function renderChat(){
               const box = document.getElementById('chatBox');
               box.innerHTML = window._chat.messages.map(m => `<div><b>${m.role}:</b> ${m.text}</div>`).join('');
@@ -229,9 +344,14 @@ def demo_home(request: Request):
               if (j.clarifiers && j.clarifiers.length){
                 const q = j.clarifiers[0].question;
                 window._chat.messages.push({role:'assistant', text: q});
+                speak(q);
               }
               if (j.saved_id){
-                window._chat.messages.push({role:'assistant', text: 'Thanks for sharing. I’ve saved your entry: ' + j.saved_id});
+                const savedMsg = (window._langMode === 'CHINESE')
+                  ? '谢谢您的分享，我已经为您保存好了。祝您早日好起来。'
+                  : 'Thanks for sharing. I’ve saved this for you. I hope you feel better soon.';
+                window._chat.messages.push({role:'assistant', text: savedMsg});
+                speak(savedMsg);
               }
               renderChat();
               document.getElementById('diaryOut').innerText = JSON.stringify({fields: window._chat.fields, ready: window._chat.ready}, null, 2);
@@ -242,6 +362,8 @@ def demo_home(request: Request):
               const r = await fetch(`/recommendations?user_id=${encodeURIComponent(userId)}&window_days=30&label=abdominal%20pain`);
               const j = await r.json();
               document.getElementById('recsOut').innerText = JSON.stringify(j, null, 2);
+              const spoken = Array.isArray(j.suggestions) ? j.suggestions.map(s => (s && s.text) ? s.text : (typeof s === 'string' ? s : '')).filter(Boolean).join('. ') : '';
+              if(spoken) speak(spoken);
             }
 
             async function doctorPack(){
@@ -261,7 +383,7 @@ def demo_home(request: Request):
               }
               const fd = new FormData();
               fd.append('user_id', userId);
-              fd.append('lang', 'en');
+              fd.append('lang', window._langCode || 'en');
               fd.append('audio_uri', audioUri);
               setVisitSummary("(processing audio...)");
               const r = await fetch('/visit/transcribe', { method:'POST', body: fd});
@@ -456,7 +578,7 @@ def demo_home(request: Request):
               const userId = document.getElementById('userId').value;
               const fd = new FormData();
               fd.append('user_id', userId);
-              fd.append('lang', 'en');
+              fd.append('lang', window._langCode || 'en');
               fd.append('audio', blob, 'visit.webm');
               setVisitSummary('(processing audio...)');
               try{
@@ -522,7 +644,7 @@ def demo_home(request: Request):
               if(window._voice.recognizer) return window._voice.recognizer;
               const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
               const rec = new SR();
-              rec.lang = 'en-US';
+              rec.lang = (window._langCode === 'zh') ? 'zh-CN' : 'en-US';
               rec.interimResults = false;
               rec.maxAlternatives = 1;
               rec.onresult = (event) => {
@@ -570,6 +692,8 @@ def demo_home(request: Request):
             }
             // Initialize button state on load
             updateVoiceUI(false);
+            updateTtsUI();
+            loadLanguageMode();
             resetVisitView();
           </script>
           </main>

@@ -340,6 +340,9 @@ hostname -I
 ip addr show
 ```
 
+**Using your laptop to run commands on the Pi (and copy-paste lines):**  
+See **`LAPTOP_PI_COMMUNICATION.md`** for: SSH from your laptop so you can paste config/commands into a terminal that runs on the Pi, and copy Pi output back to your laptop. Short version: run `ssh pi@<raspberry-pi-ip>` on the laptop, then paste with Ctrl+V (or right-click in PuTTY).
+
 ---
 
 ## Part 5: Python Environment Setup
@@ -411,13 +414,15 @@ QWEN_SPEECH_MODEL=qwen2.5-omni-7b
 
 ### Step 6.2: Create Startup Script
 
-Create a shell script to load environment variables and start the server:
+The app loads a `.env` file from the project root automatically (when `python-dotenv` is installed). So if you created `~/HealthDairy/.env` in Step 6.1, you only need to start the server from `~/HealthDairy`; no need to export variables in the script unless you prefer.
+
+Create a shell script to start the server:
 
 ```bash
 nano ~/HealthDairy/start_healthdiary.sh
 ```
 
-**Add the following**:
+**Add the following** (optional: add `export QWEN_...` lines if you are not using a `.env` file):
 ```bash
 #!/bin/bash
 
@@ -427,17 +432,13 @@ cd ~/HealthDairy
 # Activate virtual environment
 source .venv/bin/activate
 
-# Load environment variables (if using .env file, install python-dotenv first)
-# pip install python-dotenv  # Uncomment if using .env file
-# export $(cat .env | xargs)  # Uncomment if using .env file
+# Optional: set LLM variables here if you don't use .env
+# export QWEN_ENDPOINT="https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
+# export QWEN_API_KEY="your_api_key_here"
+# export QWEN_MODEL="qwen2.5-7b-instruct"
+# export QWEN_SPEECH_MODEL="qwen2.5-omni-7b"
 
-# Or set environment variables directly:
-export QWEN_ENDPOINT="https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
-export QWEN_API_KEY="your_api_key_here"
-export QWEN_MODEL="qwen2.5-7b-instruct"
-export QWEN_SPEECH_MODEL="qwen2.5-omni-7b"
-
-# Start the server
+# Start the server (loads .env from ~/HealthDairy automatically)
 uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
 ```
 
@@ -479,16 +480,33 @@ INFO:     Application startup complete.
 INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
 ```
 
-### Step 8.2: Test the API
+### Step 8.2: How to SEE the Web App in a Browser
+
+Your app runs on **port 8000** and is bound to **0.0.0.0**, so you can open it in **any browser** in two ways:
+
+**Option A – On the Raspberry Pi itself** (if you have a monitor and keyboard, or use VNC):
+- Open a browser (e.g. **Chromium** on Raspberry Pi OS: Menu → Internet → Chromium).
+- Go to: **`http://localhost:8000/demo`** (or `http://127.0.0.1:8000/demo`).
+- For API docs: **`http://localhost:8000/docs`**.
+
+**Option B – From another device** (laptop, phone, tablet on the same Wi‑Fi/network):
+- Find the Pi’s IP on the Pi: run `hostname -I` and note the first address (e.g. `192.168.1.100`).
+- On your other device, open **any browser** (Chrome, Safari, Edge, Firefox, etc.).
+- Go to: **`http://<raspberry-pi-ip>:8000/demo`** (e.g. `http://192.168.1.100:8000/demo`).
+- For API docs: **`http://<raspberry-pi-ip>:8000/docs`**.
+
+**Useful URLs** (replace `localhost` with the Pi’s IP when using another device):
+- Demo UI: `http://localhost:8000/demo`
+- API docs (Swagger): `http://localhost:8000/docs`
+- Health check: `http://localhost:8000/healthz`
+
+### Step 8.3: Test the API (curl)
 
 **From another computer on the same network** (or on the Pi itself):
 ```bash
 # Test health endpoint
 curl http://<raspberry-pi-ip>:8000/healthz
 # Should return: {"ok":true}
-
-# Test demo UI (if available)
-# Open browser: http://<raspberry-pi-ip>:8000/demo
 ```
 
 **Find your Raspberry Pi's IP address**:
@@ -496,7 +514,7 @@ curl http://<raspberry-pi-ip>:8000/healthz
 hostname -I
 ```
 
-### Step 8.3: Test Audio Endpoints
+### Step 8.4: Test Audio Endpoints
 
 **Record a test audio file** (if you need to test transcription):
 ```bash
@@ -705,6 +723,24 @@ pip install --force-reinstall -r backend/requirements.txt
 
 ### Server Issues
 
+**Browser keeps loading (never opens `/demo` or `/docs`)**:
+
+- **Most common cause: you are opening the browser on a different machine than the Pi.**  
+  `localhost` always means “this computer.” If the browser is on your **Windows/Mac laptop**, `http://localhost:8000` tries to connect to your laptop, not the Pi — and nothing is listening there, so it hangs.
+  - **Fix:** Open the browser on the **same machine where the server runs** (the Pi), or use the Pi’s IP from the other device:
+    - On the Pi: `hostname -I` → get the IP (e.g. `192.168.1.100`).
+    - In the browser on your laptop/phone: **`http://192.168.1.100:8000/demo`** (use your Pi’s IP).
+
+- **If the browser really is on the Raspberry Pi** (healthz works with `curl`, but `/demo` keeps loading):
+  - Try **`http://127.0.0.1:8000/demo/minimal`** first. If that loads, the app now streams the full `/demo` page in chunks; restart the server, then try **`http://127.0.0.1:8000/demo`** again.
+  - Try **`http://127.0.0.1:8000/demo`** instead of `localhost` (avoids IPv6 issues).
+  - In a **terminal on the Pi**, check that the server answers:
+    ```bash
+    curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/healthz
+    ```
+    You should see `200`. If this fails, the server isn’t responding on the Pi.
+  - If `curl` works but the browser still hangs, try another browser or disable extensions; check the Pi’s firewall: `sudo ufw status`.
+
 **Port already in use**:
 ```bash
 # Find process using port 8000
@@ -724,6 +760,39 @@ uvicorn backend.app.main:app --host 0.0.0.0 --port 8001
 - Verify server is listening on 0.0.0.0: `netstat -tulpn | grep 8000`
 - Check Raspberry Pi's IP address: `hostname -I`
 - Test from Raspberry Pi itself: `curl http://localhost:8000/healthz`
+
+**"LLM endpoint not configured" (or "LLM not configured") when using the demo**:
+- The app needs `QWEN_ENDPOINT` and `QWEN_API_KEY` for chat, recommendations, and transcription. Set them in one of these ways:
+
+  1. **Using a `.env` file** (recommended): Create `~/HealthDairy/.env` with:
+     ```
+     QWEN_ENDPOINT=https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions
+     QWEN_API_KEY=your_actual_dashscope_api_key
+     QWEN_MODEL=qwen2.5-7b-instruct
+     QWEN_SPEECH_MODEL=qwen2.5-omni-7b
+     ```
+     Replace `your_actual_dashscope_api_key` with your DashScope (Alibaba Cloud) API key. Then **restart the server** (the app loads `.env` on startup). Install dotenv if needed: `pip install python-dotenv` (or reinstall deps: `pip install -r backend/requirements.txt`).
+
+  2. **Export in the same terminal** before starting the server:
+     ```bash
+     export QWEN_ENDPOINT="https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
+     export QWEN_API_KEY="your_actual_dashscope_api_key"
+     uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
+     ```
+
+- If you use a **systemd service**, add the same variables in the service file under `Environment=` (see Part 9), then run `sudo systemctl daemon-reload` and `sudo systemctl restart healthdiary.service`.
+
+**".env is there and has the right content but still 'LLM endpoint not configured'"**:
+1. **Check if the app sees the vars:** Open `http://<pi-ip>:8000/env-check` in a browser. If `qwen_endpoint_configured` is `false`, the app is not loading `.env`.
+2. **Install python-dotenv on the Pi:** Run `cd ~/HealthDairy && source .venv/bin/activate && pip install -r backend/requirements.txt` so `python-dotenv` is installed (the app needs it to load `.env`).
+3. **Put `.env` in the project root:** The file must be `~/HealthDairy/.env` (same folder that contains the `backend` folder). Not inside `backend/` unless you also have one in the root.
+4. **Format:** Use `KEY=value` with no space around `=`. One variable per line. Example:
+   ```
+   QWEN_ENDPOINT=https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions
+   QWEN_API_KEY=sk-xxxxxxxx
+   ```
+5. **Restart the server** after creating or editing `.env` (stop with Ctrl+C, then start again from `~/HealthDairy`).
+6. **If you created `.env` on Windows:** Copy-paste the contents into a new file on the Pi (e.g. `nano ~/HealthDairy/.env` and paste), or use `sed -i 's/\r$//' ~/HealthDairy/.env` on the Pi to fix Windows line endings.
 
 ### Service Issues
 

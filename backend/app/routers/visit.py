@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from ..services.llm import QwenClient
+from ..language_mode import LanguageMode, get_current_language_mode, as_lang_code
 
 # Temporary storage for audio files (for DashScope ASR which requires public URLs)
 _TEMP_AUDIO_DIR = Path(__file__).resolve().parent.parent.parent / "temp_audio"
@@ -38,7 +39,7 @@ async def get_temp_audio(file_id: str):
 @router.post("/visit/transcribe")
 async def post_transcribe(
     user_id: str = Form(...),
-    lang: Literal["en", "zh"] = Form("en"),
+    lang: Literal["en", "zh"] | None = Form(None),
     audio: Optional[UploadFile] = File(None),
     audio_uri: Optional[str] = Form(None),
 ):
@@ -72,7 +73,11 @@ async def post_transcribe(
     llm = QwenClient()
     try:
         # Qwen Omni uses base64 directly, no need for file URLs
-        result = await llm.transcribe_audio(audio_bytes, lang=lang, mime=mime)
+        # If lang not provided by client, use current persisted language mode
+        mode = LanguageMode.CHINESE if lang == "zh" else LanguageMode.ENGLISH
+        if lang is None:
+            mode = get_current_language_mode()
+        result = await llm.transcribe_audio(audio_bytes, lang=as_lang_code(mode), mime=mime)
     except Exception as exc:
         import traceback
         error_detail = str(exc) or repr(exc)

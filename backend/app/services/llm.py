@@ -1,8 +1,75 @@
 import os
 import json
-from typing import Any, Dict, List, Optional
+import logging
+from typing import Any, Dict, List, Optional, Literal
 
 import httpx
+
+from ..language_mode import LanguageMode, get_current_language_mode, as_lang_code
+
+
+_log = logging.getLogger(__name__)
+
+
+def build_asr_system_prompt(language_mode: LanguageMode) -> str:
+    """
+    Build a strict system prompt for Qwen Omni transcription based on language mode.
+    - ENGLISH: transcribe to English only; keep medical details; avoid translation from Chinese unless certain.
+    - CHINESE: transcribe to Simplified Chinese only; keep medical details; no extra explanations.
+    """
+    if language_mode == LanguageMode.CHINESE:
+        return (
+            "你是一个转写引擎。请把用户语音内容转写为**简体中文**，尽量保留与症状、用药相关的细节。"
+            "不要输出英文解释或额外说明，只输出逐字转写的中文内容。"
+        )
+    return (
+        "You are a transcription engine. Transcribe the user's speech from the audio input into English only. "
+        "Preserve clinical and symptom-related details exactly as spoken. "
+        "Do NOT translate from Chinese to English; if the user speaks Chinese, transcribe those phrases in English only if you are certain of the meaning, "
+        "otherwise write them as pinyin or mark them explicitly in brackets. "
+        "Output only the verbatim transcript text, no explanations."
+    )
+
+
+def build_summary_system_prompt(
+    language_mode: LanguageMode,
+    purpose: Literal["diary", "followup"],
+) -> str:
+    """
+    Build a system prompt for patient-facing summaries and follow-up questions.
+    - ENGLISH mode: require English-only responses.
+    - CHINESE mode: require Simplified Chinese-only responses, suitable for older adults.
+    """
+    if purpose == "followup":
+        if language_mode == LanguageMode.CHINESE:
+            return (
+                "你是一位温和、有耐心的健康问诊助手，正在帮助患者整理症状信息。\n"
+                "请先用简短的一句话表达共情和安慰，然后只问**一个**后续问题（不超过 12 个字），"
+                "问题要简单、具体，便于年长者理解和回答。\n"
+                "只用简体中文回答，不要使用英文。不要给诊断或用药建议。"
+            )
+        # ENGLISH follow-up
+        return (
+            "You are a gentle, compassionate health intake assistant who deeply cares about patients' wellbeing. "
+            "Your role is to collect symptom information with empathy, patience, and understanding.\n\n"
+            "FIRST: acknowledge the patient's feelings in a short, warm sentence.\n"
+            "THEN: ask ONE concise follow-up question (<= 12 words) to collect missing information.\n"
+            "Use simple English suitable for older adults. Respond in English only. No diagnosis or medication advice."
+        )
+
+    # Diary-style daily summaries or brief explanations
+    if language_mode == LanguageMode.CHINESE:
+        return (
+            "你正在为患者生成一段简单的每日健康小结或说明。"
+            "请用简体中文、通俗易懂的表达方式，适合年长者阅读。\n"
+            "语言要温和、安慰，避免医学术语；只用简体中文回答，不要输出英文。"
+        )
+    # ENGLISH diary
+    return (
+        "You are writing a short daily health summary or explanation for the patient. "
+        "Use clear, plain English suitable for older adults, with a gentle and reassuring tone. "
+        "Respond in English only; avoid technical jargon and keep it simple."
+    )
 
 
 class QwenClient:
@@ -30,7 +97,7 @@ class QwenClient:
         # crude check for OpenAI-compatible chat endpoint
         return "chat/completions" in (self.endpoint or "")
 
-    async def _post_speech_form(self, audio_bytes: bytes, mime: str | None, lang: str, file_url: str | None = None) -> Dict[str, Any]:
+    async def _post_speech_form(self, audio_bytes: bytes, mime: str | None, lang: str, system_prompt: str, file_url: str | None = None) -> Dict[str, Any]:
         """Send audio to Qwen Omni via compatible-mode chat/completions endpoint with input_audio.
         
         Uses the same endpoint as text chat, with audio sent via input_audio in messages.content.
@@ -60,6 +127,15 @@ class QwenClient:
             "model": self.speech_model or "qwen2.5-omni-7b",
             "messages": [
                 {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": system_prompt
+                        }
+                    ]
+                },
+                {
                     "role": "user",
                     "content": [
                         {
@@ -71,7 +147,7 @@ class QwenClient:
                         },
                         {
                             "type": "text",
-                            "text": f"Please transcribe this medical consultation audio verbatim in {lang}. Identify different speakers if possible and format as: 'Speaker: text'."
+                            "text": f"Transcribe the attached audio into {lang} only. Return just the transcript text."
                         }
                     ]
                 }
@@ -446,33 +522,11 @@ class QwenClient:
             raise RuntimeError("LLM endpoint not configured")
         target = missing_field_ids[0]
 
-        # Build a compact chat with system + conversation
+        # Build a compact chat with system + conversation, respecting current language mode
+        mode = get_current_language_mode()
         sys = {
             "role": "system",
-            "content": (
-                "You are a gentle, compassionate health intake assistant who deeply cares about patients' wellbeing. "
-                "Your role is to collect symptom information with empathy, patience, and understanding.\n\n"
-                "CRITICAL: Read the user's emotional tone from their messages. Detect if they are:\n"
-                "- In pain or distress: Show genuine sympathy and care. Acknowledge their discomfort first.\n"
-                "- Angry or frustrated: Be calm, understanding, and apologetic. Validate their feelings.\n"
-                "- Impatient or rushed: Be brief, efficient, and reassuring. Acknowledge their time concerns.\n"
-                "- Anxious or worried: Be gentle, supportive, and calming. Reassure them you're here to help.\n\n"
-                "Response format:\n"
-                "1. FIRST: Acknowledge their emotional state with genuine empathy (2-8 words). Examples:\n"
-                "   - If in pain: 'I'm sorry you're experiencing this pain. Let me help you.'\n"
-                "   - If angry: 'I understand this is frustrating. I'm here to help make this easier.'\n"
-                "   - If impatient: 'I'll keep this quick. Just one more question.'\n"
-                "   - If anxious: 'I understand this is worrying. We'll get through this together.'\n"
-                "2. THEN: Ask ONE concise, concrete follow-up question (<= 12 words) to collect missing information.\n\n"
-                "Rules:\n"
-                "- Always show sympathy and care, especially when pain is mentioned\n"
-                "- Match your tone to their emotional state - be gentler when they're distressed\n"
-                "- Use warm, supportive language ('I understand', 'I'm here to help', 'Let's work through this')\n"
-                "- No diagnosis or medication advice\n"
-                "- Prefer yes/no or simple number questions\n"
-                "- Avoid vague or speculative questions\n"
-                "- If user seems unrelated, gently redirect: 'I want to make sure I understand your symptoms correctly. [question]'"
-            ),
+            "content": build_summary_system_prompt(mode, "followup"),
         }
         conv_msgs = [{"role": m.get("role", "user"), "content": m.get("text", "")} for m in messages[-6:]]
         hint = {
@@ -516,6 +570,8 @@ class QwenClient:
         labels = [((e.get('fields') or {}).get('symptom_label') or '').lower() for e in entries]
         top_labels = [l for l in {l for l in labels if l}]
         entry_text = "\n".join(summary_lines)
+        mode = get_current_language_mode()
+        lang_note = "Respond in English only, using simple language for older adults." if mode == LanguageMode.ENGLISH else "只用简体中文回答，用适合年长者的简单表达方式。"
         sys = {
             "role": "system",
             "content": (
@@ -523,7 +579,8 @@ class QwenClient:
                 '{"text": "detailed recommendation paragraph (2-3 sentences explaining what to do, why based on patterns, and how to track)", "evidence": ["entry_id:..."]}. '
                 "Rules: no diagnosis or medication advice; be detailed and professional; tailor to symptom categories observed; "
                 "explain patterns (frequency, timing, triggers, severity trends); provide actionable next steps; "
-                "always include at least one evidence token entry_id:* from provided entries; avoid generic one-liners; use clear, patient-friendly language."
+                "always include at least one evidence token entry_id:* from provided entries; avoid generic one-liners; use clear, patient-friendly language. "
+                + lang_note
             ),
         }
         user = {
@@ -564,11 +621,24 @@ class QwenClient:
         return [{"text": "Continue monitoring symptoms.", "evidence": [f"entry_id:{entries[-1].get('id')}"]}]
 
     async def summarize_doctor_pack(self, entries: List[Dict[str, Any]], window_days: int) -> Dict[str, Any]:
-        """Create a patient-oriented summary grouped by symptom, with dates and summaries.
-        Returns JSON: {symptom_groups:[{symptom_label, dates[], summary, evidence[]}], suggestions:[{text,evidence[]}]}.
+        """Create a bilingual doctor pack summary from diary entries.
+        Returns JSON:
+        {
+            english_summary: str,
+            chinese_summary: str,
+            symptom_groups:[{symptom_label, dates[], summary, evidence[]}],
+            suggestions:[{text,evidence[]}],
+            structured_events: {...}
+        }.
         """
         if not entries:
-            return {"symptom_groups": [], "suggestions": []}
+            return {
+                "english_summary": "",
+                "chinese_summary": "",
+                "symptom_groups": [],
+                "suggestions": [],
+                "structured_events": {},
+            }
         
         # Pre-group entries by symptom_label and extract dates directly from entries
         groups_by_label = {}
@@ -582,8 +652,14 @@ class QwenClient:
                 groups_by_label[label]["dates"].append(date_str)
             groups_by_label[label]["entry_ids"].append(e.get("id"))
         
+        # Build a simple structured representation of recent symptoms/events
+        structured_events: Dict[str, Any] = {
+            "window_days": window_days,
+            "entry_count": len(entries),
+            "groups_by_label": groups_by_label,
+        }
         if not self.endpoint:
-            # Heuristic: use pre-grouped data
+            # Heuristic: use pre-grouped data and basic bilingual summaries
             out = []
             for label, data in groups_by_label.items():
                 out.append({
@@ -593,7 +669,21 @@ class QwenClient:
                     "evidence": [f"entry_id:{eid}" for eid in data["entry_ids"][:5]]
                 })
             sugg = await self.recommend_from_entries(entries, window_days)
-            return {"symptom_groups": out, "suggestions": sugg}
+            english_summary = "Summary based on your recent diary entries."
+            chinese_summary = "基于您最近的健康日记生成的就诊概要。"
+            _log.info(
+                "Doctor pack generated without LLM (bilingual=True, mode=%s, en=%r, zh=%r)",
+                get_current_language_mode().name,
+                english_summary[:100],
+                chinese_summary[:100],
+            )
+            return {
+                "english_summary": english_summary,
+                "chinese_summary": chinese_summary,
+                "symptom_groups": out,
+                "suggestions": sugg,
+                "structured_events": structured_events,
+            }
 
         # Build context with labels, dates, and key fields for LLM summary generation
         lines = []
@@ -605,41 +695,69 @@ class QwenClient:
             sev = fields.get("severity")
             timing = fields.get("timing")
             triggers = fields.get("triggers") or []
-            lines.append(f"{ts} | {label} | {raw} | sev={sev} timing={timing} triggers={','.join(triggers)} | id={e.get('id','')}")
+            lines.append(
+                f"{ts} | {label} | {raw} | sev={sev} timing={timing} "
+                f"triggers={','.join(triggers)} | id={e.get('id','')}"
+            )
         ctx = "\n".join(lines)
         sys = {
             "role": "system",
             "content": (
-                "You create a patient-friendly summary grouped by symptom type to help them answer doctors' questions. Output strict JSON with: "
-                "symptom_groups:[{symptom_label (string), summary (one clear sentence describing pattern/timing/triggers/severity), evidence[]}], "
-                "suggestions:[{text,evidence[]}]. "
-                "Rules: group entries by symptom_label; provide a clear summary sentence for each symptom group; "
-                "use simple language (CEFR B1); no diagnosis or medication advice; each item MUST include ONLY evidence tokens entry_id:* from provided entries; "
-                "do NOT include dates in the response - dates will be added separately."
+                "You are generating a bilingual doctor pack from structured symptom and diary data. "
+                "Using the information provided, produce strict JSON with fields:\n"
+                "- doctor_pack_english: concise doctor-facing summary in English, suitable for a medical consultation.\n"
+                "- doctor_pack_chinese: equivalent concise summary in Simplified Chinese, covering the same symptoms and details.\n"
+                "- symptom_groups: array of {symptom_label, summary, evidence[]} objects (no dates field).\n"
+                "- suggestions: array of non-medical recommendation objects {text,evidence[]}.\n"
+                "Rules: both English and Chinese summaries MUST describe exactly the same set of symptoms, durations, and key context, "
+                "even if original inputs mixed English and Chinese. No diagnosis or medication advice."
             ),
         }
-        user = {"role": "user", "content": f"Entries (last {window_days} days) with dates, labels, and ids:\n{ctx}\nReturn JSON only (no dates field in symptom_groups)."}
+        user = {
+            "role": "user",
+            "content": (
+                "Structured symptom/events data from diary entries:\n"
+                f"{ctx}\n\n"
+                "groups_by_label and date information:\n"
+                f"{json.dumps(groups_by_label, ensure_ascii=False)}\n\n"
+                "Return strict JSON with doctor_pack_english, doctor_pack_chinese, symptom_groups, and suggestions."
+            ),
+        }
         content = await self._post_chat([sys, user], response_format="json_object")
         try:
             obj = json.loads(content)
             if isinstance(obj, dict):
-                obj.setdefault("symptom_groups", [])
-                obj.setdefault("suggestions", [])
+                english_summary = obj.get("doctor_pack_english", "") or ""
+                chinese_summary = obj.get("doctor_pack_chinese", "") or ""
+                raw_groups = obj.get("symptom_groups") or []
+                raw_suggestions = obj.get("suggestions") or []
                 valid_ids = {e.get('id') for e in entries}
+
                 def sanitize_evidence(ev):
                     ev = ev or []
-                    out = [tok for tok in ev if isinstance(tok, str) and tok.startswith('entry_id:') and (tok.split(':',1)[1] in valid_ids)]
+                    out = [
+                        tok
+                        for tok in ev
+                        if isinstance(tok, str)
+                        and tok.startswith('entry_id:')
+                        and (tok.split(':', 1)[1] in valid_ids)
+                    ]
                     return out
+
                 # Merge LLM summaries with actual dates from entries
-                final_groups = []
-                for g in obj.get('symptom_groups', []):
+                final_groups: List[Dict[str, Any]] = []
+                for g in raw_groups:
+                    if not isinstance(g, dict):
+                        continue
                     label = (g.get("symptom_label") or "symptom").lower()
                     if label in groups_by_label:
                         final_groups.append({
                             "symptom_label": label,
                             "dates": sorted(groups_by_label[label]["dates"]),
                             "summary": g.get("summary", ""),
-                            "evidence": sanitize_evidence(g.get("evidence")) or [f"entry_id:{eid}" for eid in groups_by_label[label]["entry_ids"][:5]]
+                            "evidence": sanitize_evidence(g.get("evidence")) or [
+                                f"entry_id:{eid}" for eid in groups_by_label[label]["entry_ids"][:5]
+                            ],
                         })
                 # If LLM didn't return groups, use pre-grouped data with heuristic summaries
                 if not final_groups:
@@ -648,26 +766,57 @@ class QwenClient:
                             "symptom_label": label,
                             "dates": sorted(data["dates"]),
                             "summary": f"Reported {len(data['entry_ids'])} times",
-                            "evidence": [f"entry_id:{eid}" for eid in data["entry_ids"][:5]]
+                            "evidence": [f"entry_id:{eid}" for eid in data["entry_ids"][:5]],
                         })
-                for s in obj.get('suggestions', []):
+                cleaned_suggestions: List[Dict[str, Any]] = []
+                for s in raw_suggestions:
+                    if not isinstance(s, dict):
+                        continue
                     ev = sanitize_evidence(s.get('evidence'))
                     if not ev and entries:
                         ev = [f"entry_id:{entries[-1].get('id')}"]
                     s['evidence'] = ev
-                return {"symptom_groups": final_groups, "suggestions": obj.get("suggestions", [])}
+                    cleaned_suggestions.append(s)
+
+                _log.info(
+                    "Doctor pack generated via LLM (bilingual=True, mode=%s, en=%r, zh=%r)",
+                    get_current_language_mode().name,
+                    english_summary[:100],
+                    chinese_summary[:100],
+                )
+                return {
+                    "english_summary": english_summary,
+                    "chinese_summary": chinese_summary,
+                    "symptom_groups": final_groups,
+                    "suggestions": cleaned_suggestions,
+                    "structured_events": structured_events,
+                }
         except Exception:
             pass
-        # Fallback: use pre-grouped data
+        # Fallback: use pre-grouped data with simple bilingual summaries
         out = []
         for label, data in groups_by_label.items():
             out.append({
                 "symptom_label": label,
                 "dates": sorted(data["dates"]),
                 "summary": f"Reported {len(data['entry_ids'])} times",
-                "evidence": [f"entry_id:{eid}" for eid in data["entry_ids"][:5]]
+                "evidence": [f"entry_id:{eid}" for eid in data["entry_ids"][:5]],
             })
-        return {"symptom_groups": out, "suggestions": []}
+        english_summary = "Summary based on your recent diary entries."
+        chinese_summary = "基于您最近的健康日记生成的就诊概要。"
+        _log.info(
+            "Doctor pack fallback (bilingual=True, mode=%s, en=%r, zh=%r)",
+            get_current_language_mode().name,
+            english_summary[:100],
+            chinese_summary[:100],
+        )
+        return {
+            "english_summary": english_summary,
+            "chinese_summary": chinese_summary,
+            "symptom_groups": out,
+            "suggestions": [],
+            "structured_events": structured_events,
+        }
 
     async def summarize_entry(self, entry: Dict[str, Any]) -> str:
         """Summarize a single diary entry into a brief, doctor-friendly sentence.
@@ -693,10 +842,12 @@ class QwenClient:
                 parts.append(f"fever {fields.get('fever_temp_c')}°C")
             return "; ".join(parts) if parts else (raw or "Symptom reported")
 
+        mode = get_current_language_mode()
         sys = {
             "role": "system",
             "content": (
-                "You summarize a patient diary entry into ONE concise sentence for a doctor. "
+                build_summary_system_prompt(mode, "diary")
+                + " You summarize a patient diary entry into ONE concise sentence for a doctor. "
                 "Do not quote user wording; paraphrase clinically. Include symptom, severity if given, timing/triggers if relevant, associated symptoms if notable. "
                 "Keep it brief (<= 20 words); no diagnosis or medication advice; natural language; avoid Q&A phrasing."
             ),
@@ -707,7 +858,13 @@ class QwenClient:
         }
         user = {"role": "user", "content": f"Summarize this entry from fields and context: {json.dumps(user_data, ensure_ascii=False)}"}
         content = await self._post_chat([sys, user])
-        return content.strip() or (fields.get("symptom_label") or raw or "Symptom reported")
+        text = content.strip() or (fields.get("symptom_label") or raw or "Symptom reported")
+        _log.info(
+            "Daily entry summary generated (mode=%s, text=%r)",
+            mode.name,
+            text[:100],
+        )
+        return text
 
     # --- Visit transcription & summary ---
 
@@ -723,11 +880,21 @@ class QwenClient:
             return "m4a"
         return "wav"
 
-    async def transcribe_audio(self, audio_bytes: bytes, lang: str = "en", mime: Optional[str] = None, file_url: Optional[str] = None) -> Dict[str, Any]:
-        """Send audio bytes to Qwen Omni speech endpoint for transcription with speaker tags."""
+    async def transcribe_audio(self, audio_bytes: bytes, lang: Optional[str] = None, mime: Optional[str] = None, file_url: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Send audio bytes to Qwen Omni speech endpoint for transcription with speaker tags.
+        Language mode is derived from the provided lang code ("en"/"zh") or the persisted LanguageMode.
+        """
         if not audio_bytes:
             raise ValueError("audio_bytes required")
-        data = await self._post_speech_form(audio_bytes, mime, lang, file_url)
+        # Resolve language mode: prefer explicit lang param, otherwise current persisted mode
+        mode = LanguageMode.CHINESE if lang == "zh" else LanguageMode.ENGLISH
+        if lang is None:
+            mode = get_current_language_mode()
+        lang_code = as_lang_code(mode)
+        system_prompt = build_asr_system_prompt(mode)
+        _log.info("Transcribing audio via Qwen Omni (mode=%s, lang=%s)", mode.name, lang_code)
+        data = await self._post_speech_form(audio_bytes, mime, lang_code, system_prompt, file_url)
         transcript = data.get("text") or data.get("transcript") or ""
         segments = data.get("segments") or data.get("spans") or []
         spans: List[Dict[str, Any]] = []

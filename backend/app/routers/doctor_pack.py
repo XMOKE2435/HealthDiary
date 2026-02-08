@@ -52,16 +52,31 @@ def post_doctor_pack(req: DoctorPackRequest):
     pdf_name = f"pack_{token}.html"
     pdf_path = _STORAGE_DIR / pdf_name
 
-    # LLM synthesis (best-effort)
+    # LLM synthesis (best-effort, bilingual doctor pack)
     import asyncio
     llm = QwenClient()
     try:
-        summary = asyncio.run(llm.summarize_doctor_pack(entries, req.window_days)) if llm.endpoint else {"symptom_groups":[],"suggestions":[]}
+        summary = asyncio.run(llm.summarize_doctor_pack(entries, req.window_days)) if llm.endpoint else {
+            "english_summary": "",
+            "chinese_summary": "",
+            "symptom_groups": [],
+            "suggestions": [],
+            "structured_events": {},
+        }
     except Exception as exc:
         import traceback
         print(f"Doctor pack LLM error: {exc}")
         print(traceback.format_exc())
-        summary = {"symptom_groups":[],"suggestions":[]}
+        summary = {
+            "english_summary": "",
+            "chinese_summary": "",
+            "symptom_groups": [],
+            "suggestions": [],
+            "structured_events": {},
+        }
+
+    english_summary = summary.get("english_summary", "") or ""
+    chinese_summary = summary.get("chinese_summary", "") or ""
 
     html_content = f"""<!DOCTYPE html>
 <html>
@@ -82,9 +97,16 @@ def post_doctor_pack(req: DoctorPackRequest):
 <body>
   <h1>My Health Summary</h1>
   <div class="intro">
-    <p><strong>This summary helps you answer your doctor's questions.</strong></p>
+    <p><strong>This summary helps you answer your doctor's questions.</strong><br/>
+       <span>本摘要帮助您在就诊时更好地向医生说明情况。</span></p>
     <p>Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} | Period: Last {req.window_days} days</p>
   </div>
+
+  <h2>Doctor-facing Summary (English)</h2>
+  <p>{english_summary or "No structured summary is available yet."}</p>
+
+  <h2>就诊概要（简体中文）</h2>
+  <p>{chinese_summary or "当前暂时没有可用的结构化摘要。"}</p>
 
   <h2>Symptoms by Type</h2>
 """
@@ -110,7 +132,7 @@ def post_doctor_pack(req: DoctorPackRequest):
             })
     
     if not groups:
-        html_content += "  <p>No symptoms recorded in this period.</p>\n"
+        html_content += "  <p>No symptoms recorded in this period.</p>\n  <p>本时间段内没有记录到症状。</p>\n"
     else:
         for g in groups:
             label = g.get("symptom_label", "symptom").title()
@@ -150,7 +172,10 @@ def post_doctor_pack(req: DoctorPackRequest):
         "pdf_uri": f"/doctor-pack/pdf/{pdf_name}",
         "fhir": None,
         "provenance": [f"entry_id:{e.get('id')}" for e in entries[-30:]],
-        "share_token": share_token
+        "share_token": share_token,
+        # Expose bilingual summaries so UI can render/toggle as needed
+        "english_summary": english_summary,
+        "chinese_summary": chinese_summary,
     }
 
 
