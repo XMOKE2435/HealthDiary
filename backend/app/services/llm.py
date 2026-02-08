@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Literal
 
 import httpx
@@ -9,6 +10,46 @@ from ..language_mode import LanguageMode, get_current_language_mode, as_lang_cod
 
 
 _log = logging.getLogger(__name__)
+
+
+def _load_env_from_file(env_path: Path) -> None:
+    """Parse KEY=value lines from a file and set os.environ (no python-dotenv needed)."""
+    if not env_path.exists():
+        return
+    try:
+        for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip().strip("'\"").strip()
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except Exception as e:
+        _log.warning("Could not load env from %s: %s", env_path, e)
+
+
+def _ensure_qwen_env_loaded() -> None:
+    """Load .env from project root and cwd so QWEN_* are set (e.g. on Pi where main.py load order differs)."""
+    # Project root: backend/app/services/llm.py -> parent.parent.parent
+    _root = Path(__file__).resolve().parent.parent.parent.parent
+    # Try python-dotenv first
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(_root / ".env")
+        load_dotenv(_root / "backend" / ".env")
+        load_dotenv(Path.cwd() / ".env")
+    except ImportError:
+        pass
+    # Fallback: manual parse so it works even without python-dotenv
+    if not os.getenv("QWEN_ENDPOINT") or not os.getenv("QWEN_API_KEY"):
+        _load_env_from_file(_root / ".env")
+        _load_env_from_file(_root / "backend" / ".env")
+        _load_env_from_file(Path.cwd() / ".env")
+
+
+_ensure_qwen_env_loaded()
 
 
 def build_asr_system_prompt(language_mode: LanguageMode) -> str:

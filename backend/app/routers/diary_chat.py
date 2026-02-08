@@ -1,15 +1,17 @@
+import logging
+from datetime import datetime
+from typing import Any, Dict, List, Literal, Optional
+from uuid import uuid4
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import List, Dict, Any, Literal, Optional
-from datetime import datetime
-from uuid import uuid4
 
 from ..services.llm import QwenClient
 from .diary import DiaryFields
 from ..db.session import SessionLocal
 from ..db.models import SymptomEntry
 
-
+log = logging.getLogger(__name__)
 router = APIRouter(tags=["diary-chat"])
 
 
@@ -126,19 +128,16 @@ async def diary_chat_step(req: ChatStepRequest):
     if asked_count >= max_questions:
         need = []
 
-    # Ask at most ONE question per turn; phrase it with the LLM if available
+    # Ask at most ONE question per turn; phrase it with the LLM if available, else use fixed question
     clarifiers = []
     if need:
         target = need[0]
-        # Use LLM to generate natural phrasing; if LLM is not configured, return a clear error
         try:
             q_text = await llm.generate_question([target], merged, [m.model_dump() for m in req.messages])
-        except Exception as exc:
-            # Surface a clear error instead of silent fallback so callers know to configure the LLM
-            raise HTTPException(
-                status_code=503,
-                detail="LLM not configured. Please set QWEN_ENDPOINT and QWEN_API_KEY, then restart the server."
-            ) from exc
+        except Exception as e:
+            # Fallback: use fixed question; log so you can see if it's API key / quota / network
+            log.warning("LLM generate_question failed (using fixed question): %s", e, exc_info=True)
+            q_text = CLARIFIER_QUESTIONS.get(target, "Could you tell me a bit more?")
         clarifiers = [{"id": target, "question": q_text}]
 
     # Heuristic completeness: ready when we have a label and severity
