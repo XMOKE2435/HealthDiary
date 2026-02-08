@@ -518,8 +518,13 @@ class QwenClient:
         """
         if not missing_field_ids:
             return ""
-        if not self.endpoint:
+        # Read env at request time so .env loaded after worker start is picked up
+        endpoint = (os.getenv("QWEN_ENDPOINT") or "").strip() or self.endpoint
+        if not endpoint:
             raise RuntimeError("LLM endpoint not configured")
+        if not self.endpoint and endpoint:
+            self.endpoint = endpoint
+            self.api_key = (os.getenv("QWEN_API_KEY") or "").strip() or self.api_key
         target = missing_field_ids[0]
 
         # Build a compact chat with system + conversation, respecting current language mode

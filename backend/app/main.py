@@ -1,5 +1,15 @@
 from pathlib import Path
 
+# Load .env so QWEN_ENDPOINT and QWEN_API_KEY work on Pi (and elsewhere)
+try:
+    from dotenv import load_dotenv
+    _root = Path(__file__).resolve().parent.parent.parent
+    load_dotenv(Path.cwd() / ".env")
+    load_dotenv(_root / ".env")
+    load_dotenv(_root / "backend" / ".env")
+except ImportError:
+    pass
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -36,6 +46,14 @@ def create_app() -> FastAPI:
     @app.get("/healthz")
     def healthz():
         return {"ok": True}
+
+    @app.get("/env-check")
+    def env_check():
+        """Check if LLM env vars are loaded (no secrets)."""
+        import os
+        ep = (os.getenv("QWEN_ENDPOINT") or "").strip()
+        key_set = bool((os.getenv("QWEN_API_KEY") or "").strip())
+        return {"qwen_endpoint_configured": bool(ep), "qwen_api_key_set": key_set, "llm_ok": bool(ep) and key_set}
 
     return app
 

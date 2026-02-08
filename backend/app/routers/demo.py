@@ -11,6 +11,10 @@ def demo_home(request: Request):
         """
         <html>
         <head>
+          <meta charset="utf-8">
+          <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+          <meta http-equiv="Pragma" content="no-cache">
+          <meta http-equiv="Expires" content="0">
           <title>HealthDiary Demo</title>
           <style>
             :root{
@@ -123,15 +127,16 @@ def demo_home(request: Request):
           </style>
         </head>
         <body>
-          <header style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;">
+          <header style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;">
             <div>
               <h1 id="titleText">HealthDiary MVP Demo</h1>
               <p id="subtitleText">Interactive symptom intake, detailed recommendations, and patient-ready visit preparation.</p>
             </div>
-            <div>
-              <button class="secondary" id="langToggleBtn" onclick="toggleLanguageMode()" style="background:rgba(15,23,42,0.12);color:#fff;border:1px solid rgba(255,255,255,0.4);">
+            <div style="flex-shrink:0;">
+              <button class="secondary" id="langToggleBtn" onclick="toggleLanguageMode()" title="Switch language / 切换语言" style="background:rgba(255,255,255,0.25);color:#fff;border:2px solid #fff;font-weight:600;padding:10px 16px;">
                 🌐 Language / 语言
               </button>
+              <small style="display:block;color:rgba(255,255,255,0.85);margin-top:6px;">If you don't see this button, press Ctrl+Shift+R to refresh.</small>
             </div>
           </header>
           <main>
