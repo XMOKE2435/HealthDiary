@@ -17,20 +17,30 @@ def _load_env_from_file(env_path: Path) -> bool:
     if not env_path.exists():
         return False
     try:
+        content = env_path.read_text(encoding="utf-8", errors="replace")
         loaded_qwen = False
-        for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        qwen_vars_found = []
+        for line in content.splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
             if "=" in line:
+                # Handle PowerShell format: $env:KEY="value" -> KEY=value
+                if line.startswith("$env:"):
+                    # Remove $env: prefix and parse
+                    line = line.replace("$env:", "", 1)
                 k, v = line.split("=", 1)
                 k, v = k.strip(), v.strip().strip("'\"").strip()
                 if k:
                     os.environ[k] = v  # file always wins (overwrites empty or existing)
                     if k.startswith("QWEN_"):
                         loaded_qwen = True
+                        qwen_vars_found.append(f"{k}={v[:30]}..." if len(v) > 30 else f"{k}={v}")
+        if qwen_vars_found:
+            print(f"[LLM]   Parsed from {env_path.name}: {', '.join(qwen_vars_found)}")
         return loaded_qwen
     except Exception as e:
+        print(f"[LLM]   ERROR reading {env_path}: {e}")
         _log.warning("Could not load env from %s: %s", env_path, e)
         return False
 
