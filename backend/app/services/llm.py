@@ -12,11 +12,12 @@ from ..language_mode import LanguageMode, get_current_language_mode, as_lang_cod
 _log = logging.getLogger(__name__)
 
 
-def _load_env_from_file(env_path: Path) -> None:
-    """Parse KEY=value from file and set os.environ (file wins over existing empty values)."""
+def _load_env_from_file(env_path: Path) -> bool:
+    """Parse KEY=value from file and set os.environ. Returns True if QWEN_* vars were loaded."""
     if not env_path.exists():
-        return
+        return False
     try:
+        loaded_qwen = False
         for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
@@ -26,26 +27,46 @@ def _load_env_from_file(env_path: Path) -> None:
                 k, v = k.strip(), v.strip().strip("'\"").strip()
                 if k:
                     os.environ[k] = v  # file always wins (overwrites empty or existing)
+                    if k.startswith("QWEN_"):
+                        loaded_qwen = True
+        return loaded_qwen
     except Exception as e:
         _log.warning("Could not load env from %s: %s", env_path, e)
+        return False
 
 
 def _ensure_qwen_env_loaded() -> None:
     """Load .env from project root and cwd so QWEN_* are set (e.g. on Pi)."""
     # Project root: backend/app/services/llm.py -> parent.parent.parent.parent
     _root = Path(__file__).resolve().parent.parent.parent.parent
+    cwd = Path.cwd()
+    paths_to_try = [_root / ".env", _root / "backend" / ".env", cwd / ".env"]
+    loaded_from = None
     # Load from file first (manual parse) so we overwrite any empty env vars
-    for p in (_root / ".env", _root / "backend" / ".env", Path.cwd() / ".env"):
-        _load_env_from_file(p)
-    if os.getenv("QWEN_ENDPOINT") and os.getenv("QWEN_API_KEY"):
-        _log.info("QWEN_* loaded from .env (project root: %s)", _root)
+    for p in paths_to_try:
+        if _load_env_from_file(p):
+            loaded_from = str(p)
+            break  # Found QWEN_* vars, stop
     # Then try python-dotenv for any vars not in our manual parse
     try:
         from dotenv import load_dotenv
         load_dotenv(_root / ".env", override=False)
-        load_dotenv(Path.cwd() / ".env", override=False)
+        load_dotenv(cwd / ".env", override=False)
     except ImportError:
         pass
+    # Always print so you see it even if log level is high
+    ep = (os.getenv("QWEN_ENDPOINT") or "").strip()
+    key_set = bool((os.getenv("QWEN_API_KEY") or "").strip())
+    if ep and key_set:
+        print(f"[LLM] ✓ QWEN_* loaded (endpoint: {ep[:50]}..., key: {'set' if key_set else 'empty'})")
+        if loaded_from:
+            print(f"[LLM]   Loaded from: {loaded_from}")
+    else:
+        print(f"[LLM] ✗ QWEN_* NOT loaded. Checked paths:")
+        for p in paths_to_try:
+            exists = "✓" if p.exists() else "✗"
+            print(f"[LLM]   {exists} {p}")
+        print(f"[LLM]   Current: QWEN_ENDPOINT={'set' if ep else 'EMPTY'}, QWEN_API_KEY={'set' if key_set else 'EMPTY'}")
 
 
 _ensure_qwen_env_loaded()
