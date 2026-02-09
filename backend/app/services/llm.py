@@ -13,7 +13,7 @@ _log = logging.getLogger(__name__)
 
 
 def _load_env_from_file(env_path: Path) -> None:
-    """Parse KEY=value lines from a file and set os.environ (no python-dotenv needed)."""
+    """Parse KEY=value from file and set os.environ (file wins over existing empty values)."""
     if not env_path.exists():
         return
     try:
@@ -24,29 +24,28 @@ def _load_env_from_file(env_path: Path) -> None:
             if "=" in line:
                 k, v = line.split("=", 1)
                 k, v = k.strip(), v.strip().strip("'\"").strip()
-                if k and k not in os.environ:
-                    os.environ[k] = v
+                if k:
+                    os.environ[k] = v  # file always wins (overwrites empty or existing)
     except Exception as e:
         _log.warning("Could not load env from %s: %s", env_path, e)
 
 
 def _ensure_qwen_env_loaded() -> None:
-    """Load .env from project root and cwd so QWEN_* are set (e.g. on Pi where main.py load order differs)."""
-    # Project root: backend/app/services/llm.py -> parent.parent.parent
+    """Load .env from project root and cwd so QWEN_* are set (e.g. on Pi)."""
+    # Project root: backend/app/services/llm.py -> parent.parent.parent.parent
     _root = Path(__file__).resolve().parent.parent.parent.parent
-    # Try python-dotenv first
+    # Load from file first (manual parse) so we overwrite any empty env vars
+    for p in (_root / ".env", _root / "backend" / ".env", Path.cwd() / ".env"):
+        _load_env_from_file(p)
+    if os.getenv("QWEN_ENDPOINT") and os.getenv("QWEN_API_KEY"):
+        _log.info("QWEN_* loaded from .env (project root: %s)", _root)
+    # Then try python-dotenv for any vars not in our manual parse
     try:
         from dotenv import load_dotenv
-        load_dotenv(_root / ".env")
-        load_dotenv(_root / "backend" / ".env")
-        load_dotenv(Path.cwd() / ".env")
+        load_dotenv(_root / ".env", override=False)
+        load_dotenv(Path.cwd() / ".env", override=False)
     except ImportError:
         pass
-    # Fallback: manual parse so it works even without python-dotenv
-    if not os.getenv("QWEN_ENDPOINT") or not os.getenv("QWEN_API_KEY"):
-        _load_env_from_file(_root / ".env")
-        _load_env_from_file(_root / "backend" / ".env")
-        _load_env_from_file(Path.cwd() / ".env")
 
 
 _ensure_qwen_env_loaded()

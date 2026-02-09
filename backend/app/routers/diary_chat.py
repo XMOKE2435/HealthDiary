@@ -128,16 +128,22 @@ async def diary_chat_step(req: ChatStepRequest):
     if asked_count >= max_questions:
         need = []
 
-    # Ask at most ONE question per turn; phrase it with the LLM if available, else use fixed question
+    # Ask at most ONE question per turn; use LLM to generate the question (no hardcoded fallback)
     clarifiers = []
     if need:
         target = need[0]
         try:
             q_text = await llm.generate_question([target], merged, [m.model_dump() for m in req.messages])
+        except RuntimeError as e:
+            if "not configured" in str(e).lower():
+                raise HTTPException(
+                    status_code=503,
+                    detail="LLM not configured. Set QWEN_ENDPOINT and QWEN_API_KEY in ~/HealthDiary/.env and restart the server."
+                ) from e
+            raise
         except Exception as e:
-            # Fallback: use fixed question; log so you can see if it's API key / quota / network
-            log.warning("LLM generate_question failed (using fixed question): %s", e, exc_info=True)
-            q_text = CLARIFIER_QUESTIONS.get(target, "Could you tell me a bit more?")
+            log.warning("LLM generate_question failed: %s", e, exc_info=True)
+            raise HTTPException(status_code=503, detail=f"LLM request failed: {e!s}") from e
         clarifiers = [{"id": target, "question": q_text}]
 
     # Heuristic completeness: ready when we have a label and severity
