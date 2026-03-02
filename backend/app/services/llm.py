@@ -288,7 +288,8 @@ class QwenClient:
             except httpx.HTTPStatusError as exc:
                 error_text = ""
                 try:
-                    error_text = exc.response.text[:1000]
+                    error_text = exc.response.text[:2000]
+                    print(f"DEBUG: Qwen API response body: {error_text}")
                 except Exception:
                     pass
                 error_msg = f"Qwen Omni transcription error {exc.response.status_code}"
@@ -735,14 +736,19 @@ class QwenClient:
             "groups_by_label": groups_by_label,
         }
         if not self.endpoint:
-            # Heuristic: use pre-grouped data and basic bilingual summaries
+            # Heuristic: use pre-grouped data with bilingual labels/summaries
             out = []
             for label, data in groups_by_label.items():
+                en_title = label.replace("_", " ").title()
                 out.append({
                     "symptom_label": label,
-                    "dates": sorted(data["dates"]),
+                    "symptom_label_english": en_title,
+                    "symptom_label_chinese": "",
                     "summary": f"Reported {len(data['entry_ids'])} times",
-                    "evidence": [f"entry_id:{eid}" for eid in data["entry_ids"][:5]]
+                    "summary_english": f"Reported {len(data['entry_ids'])} times",
+                    "summary_chinese": f"本周期内记录 {len(data['entry_ids'])} 次。",
+                    "dates": sorted(data["dates"]),
+                    "evidence": [f"entry_id:{eid}" for eid in data["entry_ids"][:5]],
                 })
             sugg = await self.recommend_from_entries(entries, window_days)
             english_summary = "Summary based on your recent diary entries."
@@ -780,13 +786,20 @@ class QwenClient:
             "role": "system",
             "content": (
                 "You are generating a bilingual doctor pack from structured symptom and diary data. "
-                "Using the information provided, produce strict JSON with fields:\n"
-                "- doctor_pack_english: concise doctor-facing summary in English, suitable for a medical consultation.\n"
-                "- doctor_pack_chinese: equivalent concise summary in Simplified Chinese, covering the same symptoms and details.\n"
-                "- symptom_groups: array of {symptom_label, summary, evidence[]} objects (no dates field).\n"
-                "- suggestions: array of non-medical recommendation objects {text,evidence[]}.\n"
-                "Rules: both English and Chinese summaries MUST describe exactly the same set of symptoms, durations, and key context, "
-                "even if original inputs mixed English and Chinese. No diagnosis or medication advice."
+                "Merge similar symptoms into a single entry (e.g. 'stomach ache', 'abdominal pain', 'belly pain' -> one group). "
+                "Produce strict JSON with:\n"
+                "- doctor_pack_english: concise doctor-facing summary in English.\n"
+                "- doctor_pack_chinese: equivalent summary in Simplified Chinese.\n"
+                "- symptom_groups: array of merged symptom entries. Each object MUST have:\n"
+                "  symptom_label_english: short English title (e.g. 'Abdominal pain').\n"
+                "  symptom_label_chinese: short Chinese title (e.g. '腹痛').\n"
+                "  summary_english: 1-3 sentence description in English (severity, timing, triggers if known).\n"
+                "  summary_chinese: same description in Simplified Chinese.\n"
+                "  source_labels: array of original symptom_label strings that were merged into this entry (e.g. ['abdominal pain','stomach ache']).\n"
+                "- suggestions: array of non-medical recommendations. Each object MUST have:\n"
+                "  text_english: recommendation text in English.\n"
+                "  text_chinese: same recommendation in Simplified Chinese.\n"
+                "Rules: same content in both languages. No diagnosis or medication advice."
             ),
         }
         user = {
@@ -794,9 +807,9 @@ class QwenClient:
             "content": (
                 "Structured symptom/events data from diary entries:\n"
                 f"{ctx}\n\n"
-                "groups_by_label and date information:\n"
+                "groups_by_label (use these keys in source_labels when merging):\n"
                 f"{json.dumps(groups_by_label, ensure_ascii=False)}\n\n"
-                "Return strict JSON with doctor_pack_english, doctor_pack_chinese, symptom_groups, and suggestions."
+                "Return strict JSON with doctor_pack_english, doctor_pack_chinese, symptom_groups (with symptom_label_english, symptom_label_chinese, summary_english, summary_chinese, source_labels), and suggestions (with text_english, text_chinese)."
             ),
         }
         content = await self._post_chat([sys, user], response_format="json_object")
@@ -820,28 +833,45 @@ class QwenClient:
                     ]
                     return out
 
-                # Merge LLM summaries with actual dates from entries
+                # Merge LLM summaries with actual dates: collect dates from all source_labels
                 final_groups: List[Dict[str, Any]] = []
                 for g in raw_groups:
                     if not isinstance(g, dict):
                         continue
-                    label = (g.get("symptom_label") or "symptom").lower()
-                    if label in groups_by_label:
-                        final_groups.append({
-                            "symptom_label": label,
-                            "dates": sorted(groups_by_label[label]["dates"]),
-                            "summary": g.get("summary", ""),
-                            "evidence": sanitize_evidence(g.get("evidence")) or [
-                                f"entry_id:{eid}" for eid in groups_by_label[label]["entry_ids"][:5]
-                            ],
-                        })
-                # If LLM didn't return groups, use pre-grouped data with heuristic summaries
+                    source_labels = g.get("source_labels") or []
+                    if not source_labels and g.get("symptom_label"):
+                        source_labels = [(g.get("symptom_label") or "symptom").lower()]
+                    if not source_labels:
+                        source_labels = list(groups_by_label.keys())[:1]
+                    all_dates = []
+                    all_entry_ids = []
+                    for sl in source_labels:
+                        key = (sl if isinstance(sl, str) else str(sl)).lower()
+                        if key in groups_by_label:
+                            all_dates.extend(groups_by_label[key]["dates"])
+                            all_entry_ids.extend(groups_by_label[key]["entry_ids"])
+                    all_dates = sorted(set(all_dates))
+                    final_groups.append({
+                        "symptom_label": (g.get("symptom_label") or g.get("symptom_label_english") or "symptom").lower(),
+                        "symptom_label_english": g.get("symptom_label_english") or g.get("symptom_label", "Symptom"),
+                        "symptom_label_chinese": g.get("symptom_label_chinese") or "",
+                        "summary": g.get("summary", ""),
+                        "summary_english": g.get("summary_english") or g.get("summary", ""),
+                        "summary_chinese": g.get("summary_chinese") or "",
+                        "dates": all_dates,
+                        "evidence": sanitize_evidence(g.get("evidence")) or [f"entry_id:{eid}" for eid in all_entry_ids[:10]],
+                    })
+                # If LLM didn't return groups, use pre-grouped data with heuristic bilingual fields
                 if not final_groups:
                     for label, data in groups_by_label.items():
                         final_groups.append({
                             "symptom_label": label,
-                            "dates": sorted(data["dates"]),
+                            "symptom_label_english": label.replace("_", " ").title(),
+                            "symptom_label_chinese": "",
                             "summary": f"Reported {len(data['entry_ids'])} times",
+                            "summary_english": f"Reported {len(data['entry_ids'])} times",
+                            "summary_chinese": f"本周期内记录 {len(data['entry_ids'])} 次。",
+                            "dates": sorted(data["dates"]),
                             "evidence": [f"entry_id:{eid}" for eid in data["entry_ids"][:5]],
                         })
                 cleaned_suggestions: List[Dict[str, Any]] = []
@@ -851,8 +881,12 @@ class QwenClient:
                     ev = sanitize_evidence(s.get('evidence'))
                     if not ev and entries:
                         ev = [f"entry_id:{entries[-1].get('id')}"]
-                    s['evidence'] = ev
-                    cleaned_suggestions.append(s)
+                    cleaned_suggestions.append({
+                        "text": s.get("text", "") or s.get("text_english", ""),
+                        "text_english": s.get("text_english") or s.get("text", ""),
+                        "text_chinese": s.get("text_chinese") or "",
+                        "evidence": ev,
+                    })
 
                 _log.info(
                     "Doctor pack generated via LLM (bilingual=True, mode=%s, en=%r, zh=%r)",
@@ -869,13 +903,18 @@ class QwenClient:
                 }
         except Exception:
             pass
-        # Fallback: use pre-grouped data with simple bilingual summaries
+        # Fallback: use pre-grouped data with bilingual fields
         out = []
         for label, data in groups_by_label.items():
+            en_title = label.replace("_", " ").title()
             out.append({
                 "symptom_label": label,
-                "dates": sorted(data["dates"]),
+                "symptom_label_english": en_title,
+                "symptom_label_chinese": "",
                 "summary": f"Reported {len(data['entry_ids'])} times",
+                "summary_english": f"Reported {len(data['entry_ids'])} times",
+                "summary_chinese": f"本周期内记录 {len(data['entry_ids'])} 次。",
+                "dates": sorted(data["dates"]),
                 "evidence": [f"entry_id:{eid}" for eid in data["entry_ids"][:5]],
             })
         english_summary = "Summary based on your recent diary entries."

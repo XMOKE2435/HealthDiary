@@ -329,6 +329,18 @@ scp pi@YOUR_PI_IP:/home/pi/file.txt ./
 
 ## Troubleshooting
 
+### How to fix Voice Input on the Pi
+1. **Open the demo as localhost** (so the browser allows the microphone):  
+   On the Pi, in the browser, go to **`http://127.0.0.1:8000/demo`** (not `http://<Pi-IP>:8000/demo`).
+2. **If you still get "network" error:** Chromium on the Pi often has this bug. Install Firefox and use that for the demo:
+   ```bash
+   sudo apt update
+   sudo apt install -y firefox-esr
+   ```
+   Then open **`http://127.0.0.1:8000/demo`** in Firefox and try Voice Input again.
+3. **Grant microphone permission** when the browser asks (Allow for this site).
+4. **Alternative (no browser speech API):** Use **section 4 (Visit Capture)** in the demo – "Start Recording" or "Upload / Select Audio" – which sends audio to your backend and uses your Qwen API; works in any browser.
+
 ### Issue: "Voice capture error: network" (demo voice input on Pi)
 **Cause:** The demo's **Voice Input** uses the **browser's built-in speech recognition** (e.g. Chrome's SpeechRecognition API), which sends audio to the **internet** (e.g. Google's servers). It does **not** go to your HealthDiary backend.
 

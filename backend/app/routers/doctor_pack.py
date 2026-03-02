@@ -135,27 +135,46 @@ def post_doctor_pack(req: DoctorPackRequest):
         html_content += "  <p>No symptoms recorded in this period.</p>\n  <p>本时间段内没有记录到症状。</p>\n"
     else:
         for g in groups:
-            label = g.get("symptom_label", "symptom").title()
-            dates = g.get("dates", [])
-            if not isinstance(dates, list):
-                dates = []
-            dates = [d for d in dates if d and isinstance(d, str) and len(d) >= 8]
-            summary_text = g.get("summary", "")
-            dates_str = ', '.join(sorted(set(dates))[:10])
-            if len(dates) > 10:
-                dates_str += f", ... ({len(dates)} total dates)"
+            label_en = g.get("symptom_label_english") or g.get("symptom_label", "symptom").replace("_", " ").title()
+            label_zh = g.get("symptom_label_chinese") or ""
+            title_display = f"{label_en} / {label_zh}" if label_zh else label_en
+            # Normalize dates from LLM or fallback: accept strings or objects and coerce to YYYY-MM-DD-like text
+            raw_dates = g.get("dates", [])
+            if not isinstance(raw_dates, list):
+                raw_dates = [raw_dates] if raw_dates else []
+            norm_dates = []
+            for d in raw_dates:
+                if not d:
+                    continue
+                try:
+                    s = d if isinstance(d, str) else str(d)
+                except Exception:
+                    continue
+                if len(s) >= 4:
+                    norm_dates.append(s[:10])
+            summary_en = g.get("summary_english") or g.get("summary", "")
+            summary_zh = g.get("summary_chinese") or ""
+            dates_str = ", ".join(sorted(set(norm_dates))[:10])
+            if len(norm_dates) > 10:
+                dates_str += f", ... ({len(norm_dates)} total dates)"
             html_content += f"""  <div class="symptom-group">
-    <div class="symptom-label">{label}</div>
-    <div class="dates"><strong>Occurred on:</strong> {dates_str if dates_str else 'No dates available'}</div>
-    <div class="summary">{summary_text}</div>
+    <div class="symptom-label">{title_display}</div>
+    <div class="dates"><strong>Occurred on / 发生日期:</strong> {dates_str if dates_str else "No dates available / 无"}</div>
+    <div class="summary"><strong>EN:</strong> {summary_en or "—"}</div>
+    <div class="summary"><strong>中文:</strong> {summary_zh or "—"}</div>
   </div>
 """
 
-    html_content += "  <h2>Suggestions (non-medical)</h2>\n  <ul>\n"
+    html_content += "  <h2>Suggestions (non-medical) / 建议（非医疗）</h2>\n  <ul>\n"
     for s in summary.get("suggestions", []):
-        html_content += f"    <li>{s.get('text','')}</li>\n"
+        en = s.get("text_english") or s.get("text", "")
+        zh = s.get("text_chinese") or ""
+        if zh:
+            html_content += f"    <li><strong>EN:</strong> {en or '—'} &nbsp; <strong>中文:</strong> {zh}</li>\n"
+        else:
+            html_content += f"    <li>{en or '—'}</li>\n"
     if not summary.get("suggestions"):
-        html_content += "    <li>Continue monitoring and keep brief notes on triggers/relief.</li>\n"
+        html_content += "    <li><strong>EN:</strong> Continue monitoring and keep brief notes on triggers/relief. &nbsp; <strong>中文:</strong> 继续观察并简要记录诱因与缓解方式。</li>\n"
     html_content += "  </ul>\n"
 
     html_content += """</body>

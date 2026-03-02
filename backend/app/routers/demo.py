@@ -164,15 +164,20 @@ def demo_home(request: Request):
                   <button class="secondary" id="voiceBtn" style="display:flex;align-items:center;gap:6px;" onclick="toggleVoice()">
                     <span id="voiceIcon">🎙️</span><span id="voiceLabel">Voice Input</span>
                   </button>
+                  <button class="secondary" onclick="uploadAudioForChat()" title="Upload audio file - works on Pi">📤 Upload Audio</button>
+                  <input type="file" id="chatAudioInput" accept="audio/*" style="display:none;" onchange="handleChatAudioUpload(event)">
                   <button class="secondary" id="ttsBtn" onclick="toggleTts()">🔊 Voice On</button>
                 </div>
-                <small>Tip: The assistant asks one concise follow-up per turn; once enough info is collected, it auto-saves. You can type or use voice capture.</small>
+                <small>Tip: The assistant asks one concise follow-up per turn; once enough info is collected, it auto-saves. You can type, use voice capture, or upload audio (works on Pi).</small>
                 <pre id="diaryOut"></pre>
               </div>
 
               <div class="card">
                 <h3 id="card2Title">2) GET /recommendations</h3>
-                <button onclick="getRecs()">Fetch Recommendations</button>
+                <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px;">
+                  <button onclick="getRecs()">Fetch Recommendations</button>
+                  <button class="secondary" id="recsSpeakBtn" onclick="toggleRecsSpeech()" disabled>🔊 Play Recommendations</button>
+                </div>
                 <pre id="recsOut"></pre>
               </div>
 
@@ -213,6 +218,8 @@ def demo_home(request: Request):
               supported: typeof window !== 'undefined' && 'speechSynthesis' in window && typeof SpeechSynthesisUtterance !== 'undefined',
               enabled: true
             };
+            // Last recommendations text for manual playback
+            window._recsSpeech = { text: '', active: false };
             // Visit capture state
             window._visitState = { recorder:null, chunks:[], stream:null, transcript:'', spans:[], summary:null, showTranscript:false, recordedBlob:null };
             // Language mode state
@@ -319,7 +326,7 @@ def demo_home(request: Request):
             }
             function renderChat(){
               const box = document.getElementById('chatBox');
-              box.innerHTML = window._chat.messages.map(m => `<div><b>${m.role}:</b> ${m.text}</div>`).join('');
+              box.innerHTML = window._chat.messages.map(m => `<div><b>${m.role}:<\/b> ${m.text}<\/div>`).join('');
               box.scrollTop = box.scrollHeight;
             }
             function chatReset(){ window._chat = { messages: [], fields: {}, ready:false }; renderChat(); document.getElementById('diaryOut').innerText=''; }
@@ -354,7 +361,7 @@ def demo_home(request: Request):
               if (j.saved_id){
                 const savedMsg = (window._langMode === 'CHINESE')
                   ? '谢谢您的分享，我已经为您保存好了。祝您早日好起来。'
-                  : 'Thanks for sharing. I’ve saved this for you. I hope you feel better soon.';
+                  : "Thanks for sharing. I've saved this for you. I hope you feel better soon.";
                 window._chat.messages.push({role:'assistant', text: savedMsg});
                 speak(savedMsg);
               }
@@ -367,8 +374,45 @@ def demo_home(request: Request):
               const r = await fetch(`/recommendations?user_id=${encodeURIComponent(userId)}&window_days=30&label=abdominal%20pain`);
               const j = await r.json();
               document.getElementById('recsOut').innerText = JSON.stringify(j, null, 2);
-              const spoken = Array.isArray(j.suggestions) ? j.suggestions.map(s => (s && s.text) ? s.text : (typeof s === 'string' ? s : '')).filter(Boolean).join('. ') : '';
-              if(spoken) speak(spoken);
+              const spoken = Array.isArray(j.suggestions)
+                ? j.suggestions.map(s => (s && s.text) ? s.text : (typeof s === 'string' ? s : '')).filter(Boolean).join('. ')
+                : '';
+              // Store for manual playback; do not auto-play
+              window._recsSpeech.text = spoken;
+              window._recsSpeech.active = false;
+              const btn = document.getElementById('recsSpeakBtn');
+              if(btn){
+                const hasText = !!spoken;
+                btn.disabled = !hasText || !window._tts.supported;
+                btn.textContent = hasText ? '🔊 Play Recommendations' : '🔊 Play Recommendations';
+              }
+            }
+
+            function toggleRecsSpeech(){
+              const btn = document.getElementById('recsSpeakBtn');
+              if(!btn) return;
+              const text = (window._recsSpeech && window._recsSpeech.text) || '';
+              if(!text){
+                alert('No recommendations to read yet. Fetch recommendations first.');
+                return;
+              }
+              if(!window._tts.supported){
+                alert('Voice playback is not supported in this browser.');
+                return;
+              }
+              // If currently speaking, stop
+              if(window._recsSpeech.active){
+                if(window.speechSynthesis){
+                  window.speechSynthesis.cancel();
+                }
+                window._recsSpeech.active = false;
+                btn.textContent = '🔊 Play Recommendations';
+                return;
+              }
+              // Start speaking
+              speak(text);
+              window._recsSpeech.active = true;
+              btn.textContent = '⏹ Stop Audio';
             }
 
             async function doctorPack(){
@@ -376,7 +420,7 @@ def demo_home(request: Request):
               const r = await fetch('/doctor-pack', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({user_id: userId, window_days: 30, format: 'pdf'}) });
               const j = await r.json();
               const div = document.getElementById('packLinks');
-              div.innerHTML = `<p>Pack: <a href="${j.pdf_uri}" target="_blank">Open</a></p><p>Share: <code>/shares/${j.share_token}</code> (<a href="/shares/${j.share_token}" target="_blank">Open</a>)</p>`;
+              div.innerHTML = `<p>Pack: <a href="${j.pdf_uri}" target="_blank">Open<\/a><\/p><p>Share: <code>\/shares\/${j.share_token}<\/code> (<a href="\/shares\/${j.share_token}" target="_blank">Open<\/a>)<\/p>`;
             }
 
             async function transcribe(){
@@ -468,11 +512,10 @@ def demo_home(request: Request):
               window._visitState.spans = [];
               window._visitState.summary = null;
               window._visitState.showTranscript = false;
-              document.getElementById('transOut').style.display = 'none';
-              document.getElementById('transOut').textContent = '';
+              const transOut = document.getElementById('transOut');
               const toggle = document.getElementById('transcriptToggle');
-              toggle.style.display = 'none';
-              toggle.textContent = 'Show full transcript';
+              if(transOut){ transOut.style.display = 'none'; transOut.textContent = ''; }
+              if(toggle){ toggle.style.display = 'none'; toggle.textContent = 'Show full transcript'; }
               setVisitSummary('(no summary yet)');
             }
 
@@ -661,8 +704,31 @@ def demo_home(request: Request):
               };
               rec.onerror = (event) => {
                 console.error('Voice error', event);
+                const errMsg = event.error || 'unknown';
                 updateVoiceUI(false, 'Try again');
-                alert('Voice capture error: ' + (event.error || 'unknown'));
+                // More helpful error messages
+                let userMsg = "Voice capture error: " + errMsg;
+                if(errMsg === 'network'){
+                  userMsg = "Network error: Speech recognition cannot reach the cloud service.\\n\\n" +
+                    "On Raspberry Pi, Chromium often has this bug even when internet and mic work.\\n\\n" +
+                    "Try:\\n" +
+                    "1. Use Firefox on the Pi (sudo apt install firefox-esr), or\\n" +
+                    "2. Open this page on your laptop (e.g. http://YOUR-PI-IP:8000/demo) and use Voice Input there, or\\n" +
+                    "3. Use the \\"Upload / Select Audio\\" or \\"Start Recording\\" in section 4 (Visit Capture) and upload/record there - that uses your backend, not the browser API.";
+                }else if(errMsg === 'audio-capture' || errMsg === 'not-allowed'){
+                  const isInsecure = location.protocol === 'http:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1';
+                  userMsg = "Microphone blocked (not-allowed).\\n\\n" +
+                    (isInsecure
+                      ? "You are viewing this page over HTTP from an IP address. Browsers block microphone access unless the page is served via HTTPS or from localhost.\\n\\n" +
+                        "Options:\\n" +
+                        "1. On the machine where the server runs: open http://127.0.0.1:8000/demo and try Voice Input there.\\n" +
+                        "2. Set up HTTPS for this server and open https://... instead of http://...\\n" +
+                        "3. Use \\"Upload / Select Audio\\" or \\"Start Recording\\" in section 4 (Visit Capture) - those use your backend, not the browser mic."
+                      : "Grant microphone permission when the browser asks, or check site settings (address bar) and allow microphone for this site.");
+                }else if(errMsg === 'no-speech'){
+                  userMsg = "No speech detected. Speak louder or check microphone.";
+                }
+                alert(userMsg);
               };
               rec.onend = () => {
                 window._voice.active = false;
@@ -675,6 +741,17 @@ def demo_home(request: Request):
               if(!window._voice.supported){
                 alert('Voice input not supported in this browser. Please use the latest Chrome or Edge on desktop.');
                 updateVoiceUI(false, 'Not supported');
+                return;
+              }
+              // Browsers block microphone on non-secure contexts (HTTP from IP; only HTTPS or localhost allowed)
+              const isInsecure = location.protocol === 'http:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1';
+              if(isInsecure){
+                alert("Voice Input is blocked when the page is opened over HTTP from an IP address (e.g. http://192.168.x.x:8000/demo).\\n\\n" +
+                  "To use Voice Input:\\n" +
+                  "- On the Pi: open http://127.0.0.1:8000/demo in the browser on the Pi.\\n" +
+                  "- Or set up HTTPS and open https://...\\n\\n" +
+                  "Alternatively use section 4 (Visit Capture) - Start Recording or Upload - which uses your backend.");
+                updateVoiceUI(false, "Blocked (use 127.0.0.1 or HTTPS)");
                 return;
               }
               const rec = initSpeechRecognizer();
@@ -691,15 +768,106 @@ def demo_home(request: Request):
                 updateVoiceUI(true);
               }catch(err){
                 console.error('Unable to start voice', err);
-                alert('Unable to access microphone. Please check browser permissions.');
+                let msg = 'Unable to access microphone. ';
+                if(err.name === 'NotAllowedError' || err.message?.includes('permission')){
+                  msg += 'Please grant microphone permission in browser settings (lock icon in address bar).';
+                }else{
+                  msg += 'Check browser permissions and microphone connection.';
+                }
+                alert(msg);
                 updateVoiceUI(false, 'Unavailable');
               }
             }
+
+            // Audio upload for section 1 (chat) - uses backend, works on Pi
+            function uploadAudioForChat(){
+              document.getElementById('chatAudioInput').click();
+            }
+
+            function handleChatAudioUpload(event){
+              const file = event.target.files?.[0];
+              if(!file){
+                return;
+              }
+              const mime = file.type || '';
+              if(mime && !(mime.startsWith('audio/') || mime.startsWith('video/'))){
+                alert('Please select an audio or video file.');
+                return;
+              }
+              transcribeAndSendToChat(file);
+              event.target.value = '';
+            }
+
+            async function transcribeAndSendToChat(blob){
+              if(!blob || blob.size === 0){
+                alert('No audio file selected.');
+                return;
+              }
+              if(blob.size < 100){
+                alert('Audio file too short. Please select a file with at least a few seconds of audio.');
+                return;
+              }
+              const userId = document.getElementById('userId').value;
+              const fd = new FormData();
+              fd.append('user_id', userId);
+              fd.append('lang', window._langCode || 'en');
+              fd.append('audio', blob, 'chat-audio.webm');
+              
+              // Show loading state
+              const chatInput = document.getElementById('chatInput');
+              const originalPlaceholder = chatInput.placeholder;
+              chatInput.placeholder = 'Transcribing audio...';
+              chatInput.disabled = true;
+              
+              try{
+                const resp = await fetch('/visit/transcribe', { method:'POST', body: fd});
+                const data = await resp.json();
+                if(!resp.ok){
+                  const detail = data.detail || data.message || 'Transcription failed';
+                  throw new Error(detail);
+                }
+                const transcript = data.transcript || data.text || '';
+                if(!transcript.trim()){
+                  alert('No transcript received. Please try again or speak more clearly.');
+                  return;
+                }
+                // Fill chat input and send automatically
+                chatInput.value = transcript.trim();
+                chatInput.disabled = false;
+                chatInput.placeholder = originalPlaceholder;
+                chatSend(transcript.trim());
+              }catch(err){
+                console.error('Audio transcription error', err);
+                chatInput.disabled = false;
+                chatInput.placeholder = originalPlaceholder;
+                alert('Failed to transcribe audio: ' + (err.message || err));
+              }
+            }
+
+            function setDefaultDateTime(){
+              const now = new Date();
+              const y = now.getFullYear();
+              const m = String(now.getMonth() + 1).padStart(2, '0');
+              const day = String(now.getDate()).padStart(2, '0');
+              const h = String(now.getHours()).padStart(2, '0');
+              const min = String(now.getMinutes()).padStart(2, '0');
+              const dateEl = document.getElementById('dateInput');
+              const timeEl = document.getElementById('timeInput');
+              if(dateEl) dateEl.value = `${y}-${m}-${day}`;
+              if(timeEl) timeEl.value = `${h}:${min}`;
+            }
+
             // Initialize button state on load
-            updateVoiceUI(false);
-            updateTtsUI();
-            loadLanguageMode();
-            resetVisitView();
+            try {
+              setDefaultDateTime();
+              updateVoiceUI(false);
+              updateTtsUI();
+              loadLanguageMode();
+              resetVisitView();
+              console.log('HealthDiary demo script loaded');
+            }catch(e){
+              console.error('Demo init error:', e);
+            }
           </script>
           </main>
         </body>
