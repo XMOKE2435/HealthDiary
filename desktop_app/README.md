@@ -26,7 +26,7 @@ Native desktop application built with **Python + PySide6 (Qt)**. Uses the Pi’s
 ## What the desktop app does
 
 - **Settings:** Backend URL, user ID, language (en/zh).
-- **Symptom entry:** Chat with the backend (type or “Record 5 s then send” – records from default mic, transcribes via backend, sends as message).
+- **Symptom entry:** Chat with the backend (type or voice: **Start recording** (up to **3 s**) and **Stop & transcribe** when done—same idea as the web demo; then the backend transcribes and sends the text as your message).
 - **Recommendations:** Fetch and show suggestions.
 - **Doctor pack:** Generate pack and show link.
 - **Visit capture:** Record → transcribe → get summary (all via backend).

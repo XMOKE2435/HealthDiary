@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """HealthDairy desktop app – native UI (PySide6). Uses backend for all features."""
 import io
+import queue
 import sys
+import threading
+import time
 import wave
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 import pyttsx3
 import sounddevice as sd
-from PySide6.QtCore import QObject, QSettings, QThread, Signal
+from PySide6.QtCore import QObject, QSettings, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QGroupBox,
@@ -25,6 +28,102 @@ from PySide6.QtWidgets import (
 )
 
 from api import BackendClient
+
+
+class TtsWorker:
+    """Run pyttsx3 on a dedicated thread with runAndWait().
+
+    Using engine.startLoop(False) from the Qt GUI thread does not reliably process the
+    speech queue, so nothing audible plays. Playback must use runAndWait() off the GUI thread.
+
+    On Windows, SAPI/COM often fails on the *second* utterance if one engine is reused; we create
+    a new ``pyttsx3.init()`` per phrase and initialize COM on this thread. ``stop()`` interrupts
+    the currently active engine.
+    """
+
+    _STOP = "__tts_stop__"
+    _SHUTDOWN = None  # sentinel to end worker loop
+
+    def __init__(self) -> None:
+        self._q: "queue.Queue[Optional[str]]" = queue.Queue()
+        self._thread: Optional[threading.Thread] = None
+        self._started = threading.Event()
+        self._init_ok = False
+        self._active_lock = threading.Lock()
+        self._active_eng: Any = None
+
+    def ensure_started(self) -> bool:
+        if self._thread is not None:
+            return self._init_ok
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="HealthDairy-TTS")
+        self._thread.start()
+        self._started.wait(timeout=10.0)
+        return self._init_ok
+
+    def _loop(self) -> None:
+        # Windows SAPI requires COM on this thread; required for reliable multi-utterance TTS.
+        if sys.platform == "win32":
+            try:
+                import pythoncom  # type: ignore[import-untyped]
+
+                pythoncom.CoInitialize()
+            except Exception:
+                pass
+        try:
+            probe = pyttsx3.init()
+            del probe
+            self._init_ok = True
+        except Exception:
+            self._init_ok = False
+            self._started.set()
+            return
+        self._started.set()
+        while True:
+            item = self._q.get()
+            if item is self._SHUTDOWN:
+                break
+            if item == self._STOP:
+                with self._active_lock:
+                    eng = self._active_eng
+                if eng is not None:
+                    try:
+                        eng.stop()
+                    except Exception:
+                        pass
+                continue
+            eng = None
+            try:
+                eng = pyttsx3.init()
+                with self._active_lock:
+                    self._active_eng = eng
+                eng.say(str(item))
+                eng.runAndWait()
+            except Exception:
+                pass
+            finally:
+                with self._active_lock:
+                    self._active_eng = None
+                if eng is not None:
+                    try:
+                        eng.stop()
+                    except Exception:
+                        pass
+                    try:
+                        del eng
+                    except Exception:
+                        pass
+
+    def speak(self, text: str) -> bool:
+        if not text.strip():
+            return False
+        if not self.ensure_started():
+            return False
+        self._q.put(text)
+        return True
+
+    def stop(self) -> None:
+        if self._thread is not None and self._init_ok:
+            self._q.put(self._STOP)
 
 
 class Worker(QObject):
@@ -63,6 +162,94 @@ def record_wav_seconds(seconds: float) -> bytes:
     return buf.getvalue()
 
 
+CHAT_RECORD_MAX_SEC = 3.0
+
+
+def _maybe_boost_wav_int16_mono(wav_bytes: bytes, peak_below: int = 2800, target_peak: int = 11000) -> bytes:
+    """Gently boost very quiet mic capture so ASR matches browser levels (web demo often louder).
+
+    Does not change audio that already has reasonable peak (avoids clipping normal speech).
+    """
+    try:
+        buf = io.BytesIO(wav_bytes)
+        with wave.open(buf, "rb") as w:
+            if w.getnchannels() != 1 or w.getsampwidth() != 2:
+                return wav_bytes
+            fr = w.getframerate()
+            raw = w.readframes(w.getnframes())
+        if not raw:
+            return wav_bytes
+        arr = np.frombuffer(raw, dtype=np.int16)
+        peak = int(np.max(np.abs(arr)))
+        if peak >= peak_below or peak < 1:
+            return wav_bytes
+        gain = min(target_peak / float(peak), 8.0)
+        out = np.clip(arr.astype(np.float64) * gain, -32768, 32767).astype(np.int16)
+        out_buf = io.BytesIO()
+        with wave.open(out_buf, "wb") as wo:
+            wo.setnchannels(1)
+            wo.setsampwidth(2)
+            wo.setframerate(fr)
+            wo.writeframes(out.tobytes())
+        return out_buf.getvalue()
+    except Exception:
+        return wav_bytes
+
+
+def record_wav_max_seconds_or_stop(max_sec: float, stop_event: threading.Event) -> bytes:
+    """Record from default mic for at most ``max_sec`` seconds, or until ``stop_event`` is set.
+
+    Uses one continuous ``InputStream`` (same as web MediaRecorder: no gaps between chunks).
+    Repeated ``sd.rec()`` blocks were unreliable on Windows and often confused ASR.
+    """
+    chunks: List[np.ndarray] = []
+    deadline = time.monotonic() + max(0.2, float(max_sec))
+    blocksize = max(1, int(SAMPLE_RATE * 0.05))
+
+    def callback(indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:
+        if status:
+            pass
+        chunks.append(indata.copy())
+
+    try:
+        with sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype=DTYPE,
+            callback=callback,
+            blocksize=blocksize,
+            latency="low",
+        ):
+            while time.monotonic() < deadline and not stop_event.is_set():
+                time.sleep(0.03)
+    except Exception:
+        # Fallback: one long take (no manual stop granularity)
+        try:
+            n = int(min(float(max_sec), 3.0) * SAMPLE_RATE)
+            data = sd.rec(n, samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE)
+            sd.wait()
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as w:
+                w.setnchannels(CHANNELS)
+                w.setsampwidth(2)
+                w.setframerate(SAMPLE_RATE)
+                w.writeframes(data.squeeze().tobytes())
+            return buf.getvalue()
+        except Exception:
+            return record_wav_seconds(0.2)
+
+    if not chunks:
+        return record_wav_seconds(0.2)
+    data = np.concatenate(chunks, axis=0)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(CHANNELS)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        w.writeframes(data.squeeze().tobytes())
+    return buf.getvalue()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -77,18 +264,20 @@ class MainWindow(QMainWindow):
         self._client: Optional[BackendClient] = None
         self._visit_audio: Optional[bytes] = None
         self._worker_threads: List[tuple] = []  # (QThread, Worker) refs so they aren't GC'd
-        self._tts_engine = None
+        self._tts_worker = TtsWorker()
         self._tts_supported = False
         self._tts_enabled = True
         self._tts_active_source: Optional[str] = None
         self._recs_spoken_text: str = ""
         self._meal_spoken_text: str = ""
+        self._app_busy: bool = False
+        self._chat_recording: bool = False
+        self._chat_rec_stop_event = threading.Event()
 
+        # Probe once: real playback uses TtsWorker thread + runAndWait()
         try:
-            self._tts_engine = pyttsx3.init()
-            self._tts_supported = True
+            self._tts_supported = self._tts_worker.ensure_started()
         except Exception:
-            self._tts_engine = None
             self._tts_supported = False
 
         # Tabs – settings as a tab at the end
@@ -232,19 +421,33 @@ class MainWindow(QMainWindow):
         on_success: Callable[[Any], None],
         on_error: Callable[[Exception], None],
     ) -> None:
-        """Run fn() in a background thread; call on_success(result) or on_error(exc) in main thread."""
+        """Run fn() in a background thread; call on_success/on_error on the GUI thread.
+
+        Plain Python callables connected to worker signals can run on the worker thread in PySide6,
+        which breaks UI updates. Marshal results onto the main thread with QTimer.singleShot(..., self, ...).
+        """
         thread = QThread(self)
         worker = Worker(fn)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.finished.connect(on_success)
+        worker.finished.connect(
+            lambda r: QTimer.singleShot(0, self, lambda r=r: self._finish_worker_success(on_success, r))
+        )
         worker.finished.connect(thread.quit)
-        worker.error.connect(on_error)
+        worker.error.connect(
+            lambda e: QTimer.singleShot(0, self, lambda e=e: self._finish_worker_error(on_error, e))
+        )
         worker.error.connect(thread.quit)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(worker.deleteLater)
         self._worker_threads.append((thread, worker))
         thread.start()
+
+    def _finish_worker_success(self, on_success: Callable[[Any], None], result: Any) -> None:
+        on_success(result)
+
+    def _finish_worker_error(self, on_error: Callable[[Exception], None], exc: Exception) -> None:
+        on_error(exc)
 
     def _chat_tab(self) -> QWidget:
         w = QWidget()
@@ -267,13 +470,26 @@ class MainWindow(QMainWindow):
         h = QVBoxLayout()
         self._chat_send_btn = QPushButton("Send / 发送")
         self._chat_send_btn.clicked.connect(self._on_chat_send)
-        self._chat_record_btn = QPushButton("Record (5 s) then send / 录音 5 秒并发送")
-        self._chat_record_btn.clicked.connect(self._on_chat_record)
+        self._chat_record_start_btn = QPushButton(
+            f"Start recording (max {int(CHAT_RECORD_MAX_SEC)} s) / 开始录音（最长 {int(CHAT_RECORD_MAX_SEC)} 秒）"
+        )
+        self._chat_record_start_btn.clicked.connect(self._on_chat_record_start)
+        self._chat_record_stop_btn = QPushButton("Stop & transcribe / 停止并转写")
+        self._chat_record_stop_btn.setEnabled(False)
+        self._chat_record_stop_btn.clicked.connect(self._on_chat_record_stop)
         self._chat_tts_btn = QPushButton("🔊 Voice On / 语音朗读")
         self._chat_tts_btn.clicked.connect(self._on_toggle_tts)
+        self._chat_refresh_btn = QPushButton("New symptom / 新症状（清空会话）")
+        self._chat_refresh_btn.setToolTip(
+            "Clear this chat and start another symptom entry without changing tabs.\n"
+            "清空当前对话，开始记录另一个症状。"
+        )
+        self._chat_refresh_btn.clicked.connect(self._on_chat_refresh)
         h.addWidget(self._chat_send_btn)
-        h.addWidget(self._chat_record_btn)
+        h.addWidget(self._chat_record_start_btn)
+        h.addWidget(self._chat_record_stop_btn)
         h.addWidget(self._chat_tts_btn)
+        h.addWidget(self._chat_refresh_btn)
         row_layout.addLayout(h)
         layout.addWidget(row)
         return w
@@ -377,7 +593,7 @@ class MainWindow(QMainWindow):
         return w
 
     def _ts_iso(self) -> str:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         return now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     def _on_chat_send(self):
@@ -413,52 +629,112 @@ class MainWindow(QMainWindow):
         self._run_in_background(fn, on_ok, on_err)
 
     def _on_chat_result(self, result: Dict[str, Any]):
-        self._set_busy(False)
         self._fields = result.get("fields") or {}
+        reply_lang = result.get("reply_lang") or "en"
         for c in result.get("clarifiers") or []:
             q = c.get("question", "")
             self._messages.append({"role": "assistant", "text": q})
             self._append_chat(f"Assistant: {q}")
-            self._speak(q, "en")
+            self._speak(q, reply_lang, source="chat")
         if result.get("saved_id"):
-            self._messages.append({
-                "role": "assistant",
-                "text": "Thanks. I've saved this entry for you.",
-            })
-            self._append_chat("Assistant: Thanks. I've saved this entry for you.")
-            self._speak("Thanks. I've saved this entry for you.", "en")
+            saved_line = (
+                result.get("saved_message")
+                or "Thanks. I've saved this entry for you."
+            )
+            self._messages.append({"role": "assistant", "text": saved_line})
+            self._append_chat(f"Assistant: {saved_line}")
+            self._speak(saved_line, reply_lang, source="chat")
         if result.get("ready") and not result.get("clarifiers"):
             self._messages = []
             self._fields = {}
 
-    def _on_chat_record(self):
+    def _on_chat_record_start(self):
+        """Like web demo: record until Stop or max duration, then transcribe and send."""
+        if self._chat_recording or self._app_busy:
+            return
         client = self._client_or_prompt()
         if not client:
             return
-        self._set_busy(True)
+        self._chat_rec_stop_event.clear()
+        self._chat_recording = True
+        self._set_busy(False)
         url = self._backend_edit.text().strip()
         user_id = self._user_edit.text().strip() or "demo-user-1"
-        lang = None
 
-        def fn():
-            wav = record_wav_seconds(5.0)
-            c = BackendClient(url)
-            trans = c.transcribe(user_id=user_id, audio_bytes=wav, lang="en")
-            return trans.get("transcript") or trans.get("text") or ""
+        def fn_record() -> bytes:
+            return record_wav_max_seconds_or_stop(CHAT_RECORD_MAX_SEC, self._chat_rec_stop_event)
 
-        def on_ok(transcript: str):
+        def on_record_done(wav: bytes) -> None:
+            self._chat_recording = False
             self._set_busy(False)
-            if transcript:
-                self._chat_input.setText(transcript)
-                self._on_chat_send()
-            else:
-                QMessageBox.information(self, "Record", "No speech detected. Try again.")
+            if not wav or len(wav) < 500:
+                QMessageBox.information(self, "Record", "Recording too short. Try again.")
+                return
+            # Match browser levels: quiet PC mics were rejected or ASR-hallucinated ("Thank you") before.
+            wav = _maybe_boost_wav_int16_mono(wav)
+            self._set_busy(True)
+            messages_snapshot = list(self._messages)
+            fields_snapshot = dict(self._fields)
+            ts = self._ts_iso()
 
-        def on_err(e: Exception):
-            QMessageBox.critical(self, "Error", str(e))
+            def fn_transcribe_and_chat() -> Dict[str, Any]:
+                # One worker: ASR then chat step (avoids extra thread + GUI round-trip vs transcribe → _on_chat_send).
+                c = BackendClient(url)
+                trans = c.diary_transcribe(user_id=user_id, audio_bytes=wav, lang=None)
+                transcript = (trans.get("transcript") or trans.get("text") or "").strip()
+                if not transcript:
+                    return {"ok": False}
+                msgs = messages_snapshot + [{"role": "user", "text": transcript}]
+                result = c.chat_step(
+                    user_id=user_id,
+                    messages=msgs,
+                    fields=fields_snapshot,
+                    ts=ts,
+                )
+                return {"ok": True, "transcript": transcript, "result": result}
+
+            def on_tc_ok(payload: Dict[str, Any]) -> None:
+                if not payload.get("ok"):
+                    self._set_busy(False)
+                    QMessageBox.information(self, "Record", "No speech detected. Try again.")
+                    return
+                t = payload["transcript"]
+                self._messages.append({"role": "user", "text": t})
+                self._chat_input.clear()
+                self._append_chat(f"You: {t}")
+                self._on_chat_result(payload["result"])
+                self._set_busy(False)
+
+            def on_tc_err(e: Exception) -> None:
+                self._set_busy(False)
+                QMessageBox.critical(self, "Error", str(e))
+
+            self._run_in_background(fn_transcribe_and_chat, on_tc_ok, on_tc_err)
+
+        def on_record_err(e: Exception) -> None:
+            self._chat_recording = False
             self._set_busy(False)
+            QMessageBox.critical(self, "Record", str(e))
 
-        self._run_in_background(fn, on_ok, on_err)
+        self._run_in_background(fn_record, on_record_done, on_record_err)
+
+    def _on_chat_record_stop(self):
+        """End recording early (same as web 'Stop & transcribe')."""
+        self._chat_rec_stop_event.set()
+
+    def _on_chat_refresh(self):
+        """Clear symptom chat state so the user can log another symptom (same session)."""
+        if self._app_busy or self._chat_recording:
+            QMessageBox.information(
+                self,
+                "Symptom chat",
+                "Wait until the current request or recording finishes.\n请等待当前发送或录音结束后再清空。",
+            )
+            return
+        self._messages = []
+        self._fields = {}
+        self._chat_log.clear()
+        self._chat_input.clear()
 
     def _on_fetch_recs(self):
         client = self._client_or_prompt()
@@ -705,11 +981,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Voice", "Voice playback is not supported on this system.")
             return
         self._tts_enabled = not self._tts_enabled
-        if not self._tts_enabled and self._tts_engine:
-            try:
-                self._tts_engine.stop()
-            except Exception:
-                pass
+        if not self._tts_enabled:
+            self._tts_worker.stop()
             self._tts_active_source = None
         self._update_tts_button()
 
@@ -730,17 +1003,12 @@ class MainWindow(QMainWindow):
         self._speak(self._meal_spoken_text, "en", source="meal")
 
     def _speak(self, text: str, lang: str = "en", source: Optional[str] = None):
-        if not text or not self._tts_supported or not self._tts_enabled or not self._tts_engine:
+        if not text or not self._tts_supported or not self._tts_enabled:
             return
         try:
-            # pyttsx3 does not support language codes directly everywhere; best-effort.
-            if "zh" in lang.lower():
-                # Some installs may have a Chinese voice; we don't enforce voice selection here.
-                pass
-            self._tts_engine.stop()
-            self._tts_engine.say(text)
-            self._tts_engine.startLoop(False)
-            self._tts_active_source = source
+            # pyttsx3: language/voice selection is OS-dependent; enqueue for worker thread.
+            if self._tts_worker.speak(text):
+                self._tts_active_source = source
             self._update_recs_tts_button()
             self._update_meal_tts_button()
             self._update_tts_button()
@@ -748,11 +1016,7 @@ class MainWindow(QMainWindow):
             self._tts_active_source = None
 
     def _stop_tts(self):
-        if self._tts_engine:
-            try:
-                self._tts_engine.stop()
-            except Exception:
-                pass
+        self._tts_worker.stop()
         self._tts_active_source = None
         self._update_recs_tts_button()
         self._update_meal_tts_button()
@@ -784,18 +1048,16 @@ class MainWindow(QMainWindow):
             else:
                 self._meal_tts_btn.setText("🔊 Play meal analysis / 朗读饮食分析")
 
-        def on_err(e: Exception):
-            QMessageBox.critical(self, "Meals", str(e))
-            self._set_busy(False)
-
-        self._run_in_background(fn, on_ok, on_err)
-
     def _append_chat(self, line: str):
         self._chat_log.appendPlainText(line)
 
     def _set_busy(self, busy: bool):
-        self._chat_send_btn.setEnabled(not busy)
-        self._chat_record_btn.setEnabled(not busy)
+        self._app_busy = busy
+        self._chat_send_btn.setEnabled(not busy and not self._chat_recording)
+        self._chat_record_start_btn.setEnabled(not busy and not self._chat_recording)
+        self._chat_record_stop_btn.setEnabled(self._chat_recording and not busy)
+        if hasattr(self, "_chat_refresh_btn"):
+            self._chat_refresh_btn.setEnabled(not busy and not self._chat_recording)
         self._recs_btn.setEnabled(not busy)
         self._pack_btn.setEnabled(not busy)
         self._visit_record_btn.setEnabled(not busy)

@@ -125,7 +125,10 @@ def build_summary_system_prompt(
             "Your role is to collect symptom information with empathy, patience, and understanding.\n\n"
             "FIRST: acknowledge the patient's feelings in a short, warm sentence.\n"
             "THEN: ask ONE concise follow-up question (<= 12 words) to collect missing information.\n"
-            "Use simple English suitable for older adults. Respond in English only. No diagnosis or medication advice."
+            "Use simple English suitable for older adults.\n"
+            "CRITICAL: Reply in English only. If the transcript contains earlier turns in Chinese but the patient "
+            "just wrote in English, you MUST still answer in English — do not switch to Chinese. "
+            "No diagnosis or medication advice."
         )
 
     # Diary-style daily summaries or brief explanations
@@ -740,10 +743,11 @@ class QwenClient:
             self.api_key = (os.getenv("QWEN_API_KEY") or "").strip() or self.api_key
         target = missing_field_ids[0]
 
-        # Reply in same language as user message when lang is provided
-        if lang == "zh":
+        # Reply in same language as user message when lang is provided (normalize codes)
+        lc = (lang or "").strip().lower()
+        if lc.startswith("zh") or lc in ("cmn", "yue", "wuu"):
             mode = LanguageMode.CHINESE
-        elif lang == "en":
+        elif lc.startswith("en") or lc in ("english",):
             mode = LanguageMode.ENGLISH
         else:
             mode = get_current_language_mode()
@@ -752,9 +756,20 @@ class QwenClient:
             "content": build_summary_system_prompt(mode, "followup"),
         }
         conv_msgs = [{"role": m.get("role", "user"), "content": m.get("text", "")} for m in messages[-6:]]
+        hint_body = f"Missing clarifier IDs: {missing_field_ids}. Known fields: {json.dumps(fields, ensure_ascii=False)}"
+        if mode == LanguageMode.ENGLISH:
+            hint_body += (
+                "\n\nLANGUAGE LOCK: The patient's latest message is in English. "
+                "Write your entire reply in English only, even if previous lines in the transcript are Chinese."
+            )
+        elif mode == LanguageMode.CHINESE:
+            hint_body += (
+                "\n\nLANGUAGE LOCK: The patient's latest message is in Chinese. "
+                "Write your entire reply in Simplified Chinese only."
+            )
         hint = {
             "role": "system",
-            "content": f"Missing clarifier IDs: {missing_field_ids}. Known fields: {json.dumps(fields, ensure_ascii=False)}",
+            "content": hint_body,
         }
         content = await self._post_chat([sys, hint] + conv_msgs)
         return content or "Could you tell me a bit more?"
@@ -1236,7 +1251,7 @@ class QwenClient:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        _log.info(
+        _log.debug(
             "Transcribing via Qwen3-ASR-Flash (auto_detect=%s), size=%s bytes",
             language is None,
             len(audio_bytes),

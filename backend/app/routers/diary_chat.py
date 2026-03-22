@@ -1,4 +1,6 @@
 import logging
+import re
+import unicodedata
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 from uuid import uuid4
@@ -35,44 +37,43 @@ class ChatMessage(BaseModel):
 
 
 def _infer_lang_from_text(text: str) -> str:
-    """Infer reply language from user text.
+    """Infer reply language from the *current* user message only (next turn may differ).
 
-    Product rule: follow the *current user message* language.
-    - Choose the dominant language in the message (Chinese vs English).
-      Mixed sentences are common (e.g. Singaporean code-switching).
+    Product rule:
+    - Reply in the same language as this sentence: compare CJK vs Latin letters by count.
+    - Mixed input: **majority** script wins (strict `>`). Ties (equal counts, both > 0) default
+      to English (no majority). Script-only defaults: all CJK → zh, all Latin → en.
+    - Chinese characters map to reply code ``zh`` (Mandarin for generation); Latin → ``en``.
     """
-    t = (text or "").strip()
+    t = unicodedata.normalize("NFKC", (text or "").strip())
     if not t:
         return "en"
     import re
     cjk = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]")
-    latin = re.compile(r"[A-Za-z]")
+    # ASCII Latin + fullwidth Latin (Chinese IME / copy-paste)
+    latin = re.compile(r"[A-Za-z\uFF21-\uFF3A\uFF41-\uFF5A]")
     cjk_count = sum(1 for ch in t if cjk.match(ch))
     en_count = sum(1 for ch in t if latin.match(ch))
-    # If neither, default to English (numbers/punctuation only)
+    # Numbers/punctuation only → English as default UI language
     if cjk_count == 0 and en_count == 0:
         return "en"
-    # Dominant language wins; ties default to Chinese if any CJK present
-    if cjk_count >= en_count:
+    # Strict majority (mixed sentence)
+    if cjk_count > en_count:
         return "zh"
+    if en_count > cjk_count:
+        return "en"
+    # Tie: equal CJK and Latin letter counts — no majority; neutral default
     return "en"
 
 
 def _normalize_reply_lang(req_lang: Optional[str], user_text: str) -> str:
-    """Decide reply language. Any Chinese dialect -> reply in Mandarin (zh)."""
-    # Primary signal: always follow the current user message text.
-    # This avoids "sticky" language behavior across turns (e.g. user says "no" -> reply in English).
-    inferred = _infer_lang_from_text(user_text)
-    if inferred == "en":
-        return "en"
+    """Map the *current* user message to reply language (``en`` / ``zh``).
 
-    # If inferred is Chinese, collapse any Chinese dialect to Mandarin (zh).
-    # If client explicitly says English, allow it.
-    if req_lang:
-        low = req_lang.lower().strip()
-        if low in ("en", "eng"):
-            return "en"
-    return "zh"
+    Per-turn only: the next user message may switch language. ``req_lang`` is not used to
+    choose the assistant reply (it may still be stored in provenance for ASR/client hints).
+    """
+    _ = req_lang
+    return _infer_lang_from_text(user_text)
 
 
 # Saved-message text per language (for mixed-language chat)
@@ -85,7 +86,7 @@ class ChatStepRequest(BaseModel):
     fields: Optional[Dict[str, Any]] = None
     pathway: Optional[str] = "abdominal_pain"
     ts: Optional[datetime] = None
-    lang: Optional[str] = None  # optional ASR-detected language/dialect code (reply collapses Chinese dialects to zh)
+    lang: Optional[str] = None  # optional client/ASR hint for provenance; reply language follows last user message text
 
 
 @router.post("/diary/transcribe")
@@ -157,7 +158,6 @@ async def diary_chat_step(req: ChatStepRequest):
                 merged.setdefault("associated", [])
                 if "fever" not in merged["associated"]:
                     merged["associated"].append("fever")
-                import re
                 m = re.search(r"(\d{2}(?:\.\d)?)", low)
                 if m:
                     try:
@@ -246,8 +246,13 @@ async def diary_chat_step(req: ChatStepRequest):
     # Auto-save when ready
     saved_id: Optional[str] = None
     if ready:
-        raw_joined = " ".join([m.text for m in req.messages if m.role == "user"]).strip()
-        canonical_joined = await llm.canonicalize_to_english(raw_joined)
+        user_texts = [m.text for m in req.messages if m.role == "user"]
+        raw_joined = " ".join(user_texts).strip()
+        # Avoid a second LLM round-trip when the whole chat is a single user bubble (already canonicalized above).
+        if len(user_texts) == 1:
+            canonical_joined = canonical_en
+        else:
+            canonical_joined = await llm.canonicalize_to_english(raw_joined)
         entry_id = uuid4().hex
         with SessionLocal() as db:
             entry = SymptomEntry(

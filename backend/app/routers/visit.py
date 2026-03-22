@@ -9,7 +9,6 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from ..services.llm import QwenClient
-from ..language_mode import LanguageMode, get_current_language_mode, as_lang_code
 
 # Temporary storage for audio files (for DashScope ASR which requires public URLs)
 _TEMP_AUDIO_DIR = Path(__file__).resolve().parent.parent.parent / "temp_audio"
@@ -72,12 +71,13 @@ async def post_transcribe(
 
     llm = QwenClient()
     try:
-        # Qwen Omni uses base64 directly, no need for file URLs
-        # If lang not provided by client, use current persisted language mode
-        mode = LanguageMode.CHINESE if lang == "zh" else LanguageMode.ENGLISH
-        if lang is None:
-            mode = get_current_language_mode()
-        result = await llm.transcribe_audio(audio_bytes, lang=as_lang_code(mode), mime=mime)
+        # Use Qwen3-ASR-Flash (same as /diary/transcribe). Qwen Omni chat+audio often returns 400 on some regions/Pi setups.
+        hint = lang if lang in ("zh", "en", "yue") else None
+        result = await llm.transcribe_audio_qwen3_asr(
+            audio_bytes,
+            mime=mime,
+            language=hint,
+        )
     except Exception as exc:
         import traceback
         error_detail = str(exc) or repr(exc)
