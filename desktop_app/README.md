@@ -38,6 +38,18 @@ Native desktop application built with **Python + PySide6 (Qt)**. Uses the Pi’s
 - **Python 3.9+**
 - **Backend running** (e.g. `uvicorn backend.app.main:app --host 0.0.0.0 --port 8000` on the Pi or your laptop)
 
+### Raspberry Pi / Linux: voice playback (TTS)
+
+The app tries **pyttsx3** first; on many Pis that fails even when the speaker works with `aplay`. In that case it uses **eSpeak-NG** (same ALSA path as normal playback).
+
+Install on Debian / Raspberry Pi OS:
+
+```bash
+sudo apt update && sudo apt install -y espeak-ng
+```
+
+Test: `espeak-ng "hello"` should play on your speaker (e.g. MAX98357A I2S). If that works, the in-app **Voice** button should work too.
+
 ---
 
 ## Run on your laptop (development)

@@ -2,6 +2,8 @@
 """HealthDairy desktop app – native UI (PySide6). Uses backend for all features."""
 import io
 import queue
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -31,26 +33,27 @@ from api import BackendClient
 
 
 class TtsWorker:
-    """Run pyttsx3 on a dedicated thread with runAndWait().
+    """TTS on a background thread.
 
-    Using engine.startLoop(False) from the Qt GUI thread does not reliably process the
-    speech queue, so nothing audible plays. Playback must use runAndWait() off the GUI thread.
-
-    On Windows, SAPI/COM often fails on the *second* utterance if one engine is reused; we create
-    a new ``pyttsx3.init()`` per phrase and initialize COM on this thread. ``stop()`` interrupts
-    the currently active engine.
+    - **Windows:** ``pyttsx3`` (SAPI) with COM init + fresh engine per phrase.
+    - **Linux / Pi:** ``pyttsx3`` if it initializes; otherwise **eSpeak-NG** via subprocess
+      (uses ALSA like ``aplay``). Pi often has working I2S/USB audio but no pyttsx3 driver —
+      install ``sudo apt install espeak-ng`` so ``espeak-ng`` is on ``PATH``.
     """
 
     _STOP = "__tts_stop__"
     _SHUTDOWN = None  # sentinel to end worker loop
 
     def __init__(self) -> None:
-        self._q: "queue.Queue[Optional[str]]" = queue.Queue()
+        self._q: "queue.Queue[Any]" = queue.Queue()
         self._thread: Optional[threading.Thread] = None
         self._started = threading.Event()
         self._init_ok = False
+        self._backend = "none"  # "pyttsx3" | "espeak"
+        self._espeak_bin: Optional[str] = None
         self._active_lock = threading.Lock()
         self._active_eng: Any = None
+        self._active_proc: Optional[subprocess.Popen] = None
 
     def ensure_started(self) -> bool:
         if self._thread is not None:
@@ -60,8 +63,62 @@ class TtsWorker:
         self._started.wait(timeout=10.0)
         return self._init_ok
 
+    def _pick_espeak(self) -> Optional[str]:
+        for name in ("espeak-ng", "espeak"):
+            p = shutil.which(name)
+            if p:
+                return p
+        return None
+
+    def _interrupt_playback(self) -> None:
+        with self._active_lock:
+            eng = self._active_eng
+            proc = self._active_proc
+            self._active_eng = None
+            self._active_proc = None
+        if eng is not None:
+            try:
+                eng.stop()
+            except Exception:
+                pass
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def _speak_espeak(self, text: str, lang: str) -> None:
+        if not self._espeak_bin:
+            return
+        lc = (lang or "en").lower().strip()
+        cmd: List[str] = [self._espeak_bin, "-s", "150"]
+        if lc.startswith("zh"):
+            cmd.extend(["-v", "zh"])
+        else:
+            cmd.extend(["-v", "en"])
+        cmd.append(text)
+        proc: Optional[subprocess.Popen] = None
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            with self._active_lock:
+                self._active_proc = proc
+            proc.wait()
+        except Exception:
+            pass
+        finally:
+            with self._active_lock:
+                if self._active_proc is proc:
+                    self._active_proc = None
+
     def _loop(self) -> None:
-        # Windows SAPI requires COM on this thread; required for reliable multi-utterance TTS.
         if sys.platform == "win32":
             try:
                 import pythoncom  # type: ignore[import-untyped]
@@ -69,34 +126,51 @@ class TtsWorker:
                 pythoncom.CoInitialize()
             except Exception:
                 pass
+
+        self._backend = "none"
         try:
             probe = pyttsx3.init()
             del probe
+            self._backend = "pyttsx3"
             self._init_ok = True
         except Exception:
-            self._init_ok = False
-            self._started.set()
-            return
+            self._espeak_bin = self._pick_espeak()
+            if self._espeak_bin:
+                self._backend = "espeak"
+                self._init_ok = True
+            else:
+                self._init_ok = False
+
         self._started.set()
+        if not self._init_ok:
+            return
+
         while True:
             item = self._q.get()
             if item is self._SHUTDOWN:
                 break
             if item == self._STOP:
-                with self._active_lock:
-                    eng = self._active_eng
-                if eng is not None:
-                    try:
-                        eng.stop()
-                    except Exception:
-                        pass
+                self._interrupt_playback()
                 continue
+
+            text: str
+            lang: str = "en"
+            if isinstance(item, tuple) and len(item) >= 2 and item[0] == "say":
+                text = str(item[1])
+                lang = str(item[2]) if len(item) > 2 else "en"
+            else:
+                text = str(item)
+
+            if self._backend == "espeak":
+                self._speak_espeak(text, lang)
+                continue
+
             eng = None
             try:
                 eng = pyttsx3.init()
                 with self._active_lock:
                     self._active_eng = eng
-                eng.say(str(item))
+                eng.say(text)
                 eng.runAndWait()
             except Exception:
                 pass
@@ -113,12 +187,12 @@ class TtsWorker:
                     except Exception:
                         pass
 
-    def speak(self, text: str) -> bool:
+    def speak(self, text: str, lang: str = "en") -> bool:
         if not text.strip():
             return False
         if not self.ensure_started():
             return False
-        self._q.put(text)
+        self._q.put(("say", text, lang or "en"))
         return True
 
     def stop(self) -> None:
@@ -1006,8 +1080,8 @@ class MainWindow(QMainWindow):
         if not text or not self._tts_supported or not self._tts_enabled:
             return
         try:
-            # pyttsx3: language/voice selection is OS-dependent; enqueue for worker thread.
-            if self._tts_worker.speak(text):
+            # TTS worker: pyttsx3 (Windows) or espeak-ng (Linux/Pi); pass lang for voice selection.
+            if self._tts_worker.speak(text, lang):
                 self._tts_active_source = source
             self._update_recs_tts_button()
             self._update_meal_tts_button()
