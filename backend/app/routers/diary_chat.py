@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from ..services.llm import QwenClient
@@ -34,12 +34,85 @@ class ChatMessage(BaseModel):
     text: str
 
 
+def _infer_lang_from_text(text: str) -> str:
+    """Infer reply language from user text.
+
+    Product rule: follow the *current user message* language.
+    - Choose the dominant language in the message (Chinese vs English).
+      Mixed sentences are common (e.g. Singaporean code-switching).
+    """
+    t = (text or "").strip()
+    if not t:
+        return "en"
+    import re
+    cjk = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]")
+    latin = re.compile(r"[A-Za-z]")
+    cjk_count = sum(1 for ch in t if cjk.match(ch))
+    en_count = sum(1 for ch in t if latin.match(ch))
+    # If neither, default to English (numbers/punctuation only)
+    if cjk_count == 0 and en_count == 0:
+        return "en"
+    # Dominant language wins; ties default to Chinese if any CJK present
+    if cjk_count >= en_count:
+        return "zh"
+    return "en"
+
+
+def _normalize_reply_lang(req_lang: Optional[str], user_text: str) -> str:
+    """Decide reply language. Any Chinese dialect -> reply in Mandarin (zh)."""
+    # Primary signal: always follow the current user message text.
+    # This avoids "sticky" language behavior across turns (e.g. user says "no" -> reply in English).
+    inferred = _infer_lang_from_text(user_text)
+    if inferred == "en":
+        return "en"
+
+    # If inferred is Chinese, collapse any Chinese dialect to Mandarin (zh).
+    # If client explicitly says English, allow it.
+    if req_lang:
+        low = req_lang.lower().strip()
+        if low in ("en", "eng"):
+            return "en"
+    return "zh"
+
+
+# Saved-message text per language (for mixed-language chat)
+SAVED_MSG = {"en": "Thanks for sharing. I've saved this for you. I hope you feel better soon.", "zh": "谢谢您的分享，我已经为您保存好了。祝您早日好起来。"}
+
+
 class ChatStepRequest(BaseModel):
     user_id: str
     messages: List[ChatMessage]
     fields: Optional[Dict[str, Any]] = None
     pathway: Optional[str] = "abdominal_pain"
     ts: Optional[datetime] = None
+    lang: Optional[str] = None  # optional ASR-detected language/dialect code (reply collapses Chinese dialects to zh)
+
+
+@router.post("/diary/transcribe")
+async def diary_transcribe(
+    user_id: str = Form(...),
+    audio: UploadFile = File(...),
+    lang: Optional[str] = Form(None),
+):
+    """Transcribe audio for diary/symptom input using Qwen3-ASR-Flash (auto language detection)."""
+    audio_bytes = await audio.read()
+    mime = audio.content_type or "audio/webm"
+    if not audio_bytes or len(audio_bytes) < 100:
+        raise HTTPException(
+            status_code=400,
+            detail="Audio file is empty or too small. Please record at least a second of speech.",
+        )
+    llm = QwenClient()
+    try:
+        result = await llm.transcribe_audio_qwen3_asr(
+            audio_bytes,
+            mime=mime,
+            language=lang if lang in ("zh", "en", "yue") else None,
+        )
+    except Exception as exc:
+        log.exception("Diary transcribe failed")
+        raise HTTPException(status_code=502, detail=f"Transcription failed: {exc}") from exc
+    return result
 
 
 @router.post("/diary/chat/step")
@@ -55,8 +128,13 @@ async def diary_chat_step(req: ChatStepRequest):
     if not last_user_text:
         raise HTTPException(status_code=400, detail="last user message missing")
 
+    # Reply language: English for English; Chinese dialects collapse to Mandarin (zh)
+    reply_lang = _normalize_reply_lang(req.lang, last_user_text)
+
     llm = QwenClient()
-    nlu = await llm.nlu_slot_fill(last_user_text)
+    # Canonicalize to English for understanding (single canonical language)
+    canonical_en = await llm.canonicalize_to_english(last_user_text)
+    nlu = await llm.nlu_slot_fill(canonical_en)
     new_fields = nlu.get("fields", {}) or {}
     merged = dict(req.fields or {})
     # Merge: prefer non-null from new_fields
@@ -69,12 +147,13 @@ async def diary_chat_step(req: ChatStepRequest):
     reverse_map = {v: k for k, v in CLARIFIER_QUESTIONS.items()}
     last_cid = reverse_map.get(last_assistant_text)
     low = last_user_text.lower().strip()
+    low_zh = (last_user_text or "").strip()
     if last_cid:
         if last_cid == "clarifier.meal_relation":
-            if low in ("no", "none", "no relation"):
+            if low in ("no", "none", "no relation") or low_zh in ("不", "不是", "没有", "無", "无"):
                 merged["timing"] = "none"
         if last_cid == "clarifier.fever":
-            if low.startswith("yes") or "yes" in low:
+            if low.startswith("yes") or "yes" in low or low_zh in ("是", "有", "有的", "有啊", "有喔"):
                 merged.setdefault("associated", [])
                 if "fever" not in merged["associated"]:
                     merged["associated"].append("fever")
@@ -85,10 +164,10 @@ async def diary_chat_step(req: ChatStepRequest):
                         merged["fever_temp_c"] = float(m.group(1))
                     except Exception:
                         pass
-            if low in ("no", "none"):
+            if low in ("no", "none") or low_zh in ("不", "没有", "无", "無", "否"):
                 merged["fever_temp_c"] = None
         if last_cid == "clarifier.bowel_changes":
-            if low in ("no", "none", "no change", "no changes"):
+            if low in ("no", "none", "no change", "no changes") or low_zh in ("没有", "无", "無"):
                 merged["bowel_changes"] = "none"
 
     # Determine which clarifiers are still missing based on merged fields and symptom pathway
@@ -133,7 +212,7 @@ async def diary_chat_step(req: ChatStepRequest):
     if need:
         target = need[0]
         try:
-            q_text = await llm.generate_question([target], merged, [m.model_dump() for m in req.messages])
+            q_text = await llm.generate_question([target], merged, [m.model_dump() for m in req.messages], lang=reply_lang)
         except RuntimeError as e:
             if "not configured" in str(e).lower():
                 raise HTTPException(
@@ -167,20 +246,25 @@ async def diary_chat_step(req: ChatStepRequest):
     # Auto-save when ready
     saved_id: Optional[str] = None
     if ready:
-        text_joined = " ".join([m.text for m in req.messages if m.role == "user"]).strip()
+        raw_joined = " ".join([m.text for m in req.messages if m.role == "user"]).strip()
+        canonical_joined = await llm.canonicalize_to_english(raw_joined)
         entry_id = uuid4().hex
         with SessionLocal() as db:
             entry = SymptomEntry(
                 id=entry_id,
                 user_id=req.user_id,
                 ts=req.ts or datetime.utcnow(),
-                symptom_raw=text_joined or "(conversation)",
+                # Store canonical English for downstream analytics and doctor pack generation
+                symptom_raw=canonical_joined or "(conversation)",
                 input_mode="chat",
                 fields_json=SymptomEntry.dumps(merged),
                 provenance_json=SymptomEntry.dumps({
                     "nlu": True,
                     "user_confirmed": True,
                     "chat": True,
+                    "raw_text": raw_joined,
+                    "canonical_en": canonical_joined,
+                    "detected_lang": req.lang,
                     "messages": [m.model_dump() for m in req.messages]
                 }),
             )
@@ -188,7 +272,17 @@ async def diary_chat_step(req: ChatStepRequest):
             db.commit()
         saved_id = entry_id
 
-    return {"fields": merged, "clarifiers": clarifiers, "ready": ready, "saved_id": saved_id}
+    saved_message: Optional[str] = None
+    if saved_id:
+        saved_message = SAVED_MSG.get(reply_lang, SAVED_MSG["en"])
+    return {
+        "fields": merged,
+        "clarifiers": clarifiers,
+        "ready": ready,
+        "saved_id": saved_id,
+        "saved_message": saved_message,
+        "reply_lang": reply_lang,
+    }
 
 
 class ChatCommitRequest(BaseModel):
@@ -202,17 +296,31 @@ class ChatCommitRequest(BaseModel):
 def diary_chat_commit(req: ChatCommitRequest):
     if not req.messages:
         raise HTTPException(status_code=400, detail="messages required")
-    text_joined = " ".join([m.text for m in req.messages if m.role == "user"]).strip()
+    raw_joined = " ".join([m.text for m in req.messages if m.role == "user"]).strip()
+    # Best-effort canonical English storage (no await here; commit is sync)
+    # If LLM not configured, store raw text as-is.
+    try:
+        import asyncio
+        llm = QwenClient()
+        canonical_joined = asyncio.run(llm.canonicalize_to_english(raw_joined))
+    except Exception:
+        canonical_joined = raw_joined
     entry_id = uuid4().hex
     with SessionLocal() as db:
         entry = SymptomEntry(
             id=entry_id,
             user_id=req.user_id,
             ts=req.ts or datetime.utcnow(),
-            symptom_raw=text_joined or "(conversation)",
+            symptom_raw=canonical_joined or "(conversation)",
             input_mode="chat",
             fields_json=SymptomEntry.dumps(req.fields),
-            provenance_json=SymptomEntry.dumps({"nlu": True, "user_confirmed": True, "chat": True}),
+            provenance_json=SymptomEntry.dumps({
+                "nlu": True,
+                "user_confirmed": True,
+                "chat": True,
+                "raw_text": raw_joined,
+                "canonical_en": canonical_joined,
+            }),
         )
         db.add(entry)
         db.commit()

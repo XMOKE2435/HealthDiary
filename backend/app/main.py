@@ -14,7 +14,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from .db.session import engine, Base
-from .routers import diary, recommendations, doctor_pack, visit, shares, demo, checks, diary_chat, language_mode
+from .routers import diary, recommendations, doctor_pack, visit, shares, demo, checks, diary_chat, language_mode, meal
 
 
 def create_app() -> FastAPI:
@@ -36,6 +36,7 @@ def create_app() -> FastAPI:
     app.include_router(checks.router)
     app.include_router(diary_chat.router)
     app.include_router(language_mode.router)
+    app.include_router(meal.router)
     app.include_router(demo.router)
 
     # Serve static assets (e.g., generated doctor-pack PDFs)

@@ -557,6 +557,70 @@ class QwenClient:
             # if provider returned plain text, fallback to empty
             return {"fields": {}, "provenance": {"nlu": True}}
 
+    async def canonicalize_to_english(self, text: str) -> str:
+        """Convert arbitrary user text (possibly mixed-language) into canonical English.
+
+        - Preserve medical meaning, numbers, units, and proper nouns (med names).
+        - If already English, return cleaned English (no extra commentary).
+        - If endpoint not configured, return input text unchanged.
+        """
+        t = (text or "").strip()
+        if not t or not self.endpoint:
+            return t
+        system = {
+            "role": "system",
+            "content": (
+                "You convert user health-intake text into canonical English. "
+                "Input may mix English, Mandarin, or Chinese dialect words. "
+                "Output MUST be English only, preserving meaning and medical details. "
+                "Keep numbers/units exactly (e.g., 39.2°C, 2 days). "
+                "Do not add new information. Output only the rewritten English text."
+            ),
+        }
+        user = {"role": "user", "content": t}
+        out = (await self._post_chat([system, user])).strip()
+        return out or t
+
+    async def parse_meal(self, text: str) -> Dict[str, Any]:
+        """Parse a free-text meal description into meal_type and items."""
+        if not self.endpoint:
+            # Simple heuristic fallback
+            t = text.lower()
+            if "breakfast" in t or "morning" in t:
+                meal_type = "breakfast"
+            elif "lunch" in t or "noon" in t:
+                meal_type = "lunch"
+            elif "dinner" in t or "evening" in t or "supper" in t:
+                meal_type = "dinner"
+            else:
+                meal_type = "other"
+            return {"meal_type": meal_type, "items": [text.strip()] if text.strip() else []}
+
+        system = {
+            "role": "system",
+            "content": (
+                "You are a nutrition assistant. Parse a meal description into strict JSON with keys:\n"
+                "meal_type: one of ['breakfast','lunch','dinner','snack','other'].\n"
+                "items: array of objects with keys {name, quantity_text} where quantity_text is a short human phrase "
+                "like 'one bowl', '2 slices', 'a handful', or '' if unspecified.\n"
+                "Only output compact JSON, no explanation."
+            ),
+        }
+        user = {
+            "role": "user",
+            "content": text,
+        }
+        content = await self._post_chat([system, user], response_format="json_object")
+        try:
+            obj = json.loads(content)
+            if isinstance(obj, dict):
+                meal_type = (obj.get("meal_type") or "other").lower()
+                items = obj.get("items") or []
+                return {"meal_type": meal_type, "items": items}
+        except Exception:
+            pass
+        return {"meal_type": "other", "items": [text.strip()] if text.strip() else []}
+
     async def clarifier_select(self, fields: Dict[str, Any], pathway: str) -> List[str]:
         # Whitelisted clarifiers per pathway (demo subset)
         whitelist: Dict[str, List[str]] = {
@@ -584,9 +648,86 @@ class QwenClient:
             return [c for c in resp if c in allowed][:2]
         return allowed[:2]
 
-    async def generate_question(self, missing_field_ids: List[str], fields: Dict[str, Any], messages: List[Dict[str, str]]) -> str:
+    async def analyze_meals(self, meals: List[Dict[str, Any]], window_days: int) -> Dict[str, Any]:
+        """Analyze meals over a period and return nutrition summary and suggestions."""
+        if not meals:
+            return {
+                "summary": "No meals recorded in this period.",
+                "suggestions": [],
+            }
+        if not self.endpoint:
+            return {
+                "summary": f"Simple summary for {len(meals)} meals in the last {window_days} days.",
+                "suggestions": [
+                    {"text": "Try to include vegetables in at least two meals per day."}
+                ],
+            }
+
+        lines = []
+        for m in meals:
+            ts = m.get("ts", "")[:10]
+            meal_type = m.get("meal_type", "")
+            items = m.get("items") or []
+            if isinstance(items, list):
+                item_names = []
+                for it in items:
+                    if isinstance(it, dict):
+                        item_names.append(it.get("name") or "")
+                    else:
+                        item_names.append(str(it))
+                items_str = ", ".join([x for x in item_names if x])
+            else:
+                items_str = str(items)
+            lines.append(f"{ts} | {meal_type} | {items_str}")
+        ctx = "\n".join(lines)
+        system = {
+            "role": "system",
+            "content": (
+                "You are a professional nutritionist. Analyze the patient's meals over the given period. "
+                "Consider balance of macronutrients, variety of fruits/vegetables, processed foods, sugar, "
+                "and overall portion patterns. "
+                "Return strict JSON with keys:\n"
+                "summary: short English paragraph summarizing nutrition quality and patterns.\n"
+                "suggestions: array of 3-5 actionable English suggestions, each as an object {text}.\n"
+                "Do not mention that you are an AI; speak directly to the patient. No diagnosis or medication advice."
+            ),
+        }
+        user = {
+            "role": "user",
+            "content": (
+                f"Analyze these meals from the last {window_days} days:\n{ctx}\n\n"
+                "Return JSON with summary and suggestions as described."
+            ),
+        }
+        content = await self._post_chat([system, user], response_format="json_object")
+        try:
+            obj = json.loads(content)
+            if isinstance(obj, dict):
+                summary = obj.get("summary") or ""
+                raw_suggs = obj.get("suggestions") or []
+                suggestions: List[Dict[str, Any]] = []
+                for s in raw_suggs:
+                    if isinstance(s, dict) and s.get("text"):
+                        suggestions.append({"text": s["text"]})
+                    elif isinstance(s, str):
+                        suggestions.append({"text": s})
+                return {"summary": summary, "suggestions": suggestions}
+        except Exception:
+            pass
+        return {
+            "summary": "Unable to analyze meals with the current configuration.",
+            "suggestions": [],
+        }
+
+    async def generate_question(
+        self,
+        missing_field_ids: List[str],
+        fields: Dict[str, Any],
+        messages: List[Dict[str, str]],
+        lang: Optional[str] = None,
+    ) -> str:
         """Return ONE short, natural-language question targeting the highest-priority missing field.
-        Requires LLM endpoint; will raise if unavailable so caller can handle.
+        If lang is 'zh' reply in Chinese, else English. If lang is None, uses get_current_language_mode().
         """
         if not missing_field_ids:
             return ""
@@ -599,8 +740,13 @@ class QwenClient:
             self.api_key = (os.getenv("QWEN_API_KEY") or "").strip() or self.api_key
         target = missing_field_ids[0]
 
-        # Build a compact chat with system + conversation, respecting current language mode
-        mode = get_current_language_mode()
+        # Reply in same language as user message when lang is provided
+        if lang == "zh":
+            mode = LanguageMode.CHINESE
+        elif lang == "en":
+            mode = LanguageMode.ENGLISH
+        else:
+            mode = get_current_language_mode()
         sys = {
             "role": "system",
             "content": build_summary_system_prompt(mode, "followup"),
@@ -1034,6 +1180,96 @@ class QwenClient:
         return {
             "transcript": transcript or "\n".join(s.get("text", "") for s in spans if s.get("text")),
             "spans": spans,
+        }
+
+    async def transcribe_audio_qwen3_asr(
+        self,
+        audio_bytes: bytes,
+        mime: Optional[str] = None,
+        language: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Transcribe audio using Qwen3-ASR-Flash (DashScope).
+        - If language is omitted, the model auto-detects (zh, en, yue, etc.).
+        - Returns {"transcript": str, "language": str, "spans": [...]}.
+        """
+        if not audio_bytes:
+            raise ValueError("audio_bytes required")
+        base = (self.endpoint or "").strip()
+        if not base:
+            raise RuntimeError(
+                "QWEN_ENDPOINT must be set to the compatible-mode endpoint (e.g. https://dashscope-intl.aliyuncs.com/compatible-mode/v1) for Qwen3-ASR."
+            )
+        if not self.api_key:
+            raise RuntimeError("QWEN_API_KEY not configured.")
+
+        endpoint = base if "chat/completions" in base else base.rstrip("/") + "/chat/completions"
+
+        import base64
+        fmt = self._audio_format_from_mime(mime)
+        audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+        data_url = f"data:audio/{fmt};base64,{audio_b64}"
+
+        asr_options: Dict[str, Any] = {"enable_itn": False}
+        if language is not None:
+            asr_options["language"] = language
+
+        payload: Dict[str, Any] = {
+            "model": "qwen3-asr-flash",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"data": data_url, "format": fmt},
+                        }
+                    ],
+                }
+            ],
+            "stream": False,
+        }
+        # extra_body for OpenAI SDK; we use raw POST so pass as top-level if API expects it
+        payload["asr_options"] = asr_options
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        _log.info(
+            "Transcribing via Qwen3-ASR-Flash (auto_detect=%s), size=%s bytes",
+            language is None,
+            len(audio_bytes),
+        )
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(endpoint, headers=headers, json=payload)
+            r.raise_for_status()
+            data = r.json()
+
+        choices = data.get("choices") or []
+        if not choices:
+            raise RuntimeError("Qwen3-ASR returned no choices")
+        msg = choices[0].get("message") or {}
+        raw_content = msg.get("content")
+        if isinstance(raw_content, str):
+            transcript = raw_content
+        elif isinstance(raw_content, list):
+            transcript = ""
+            for item in raw_content:
+                if isinstance(item, dict) and item.get("text"):
+                    transcript = item.get("text", "")
+                    break
+        else:
+            transcript = ""
+        detected_lang = None
+        for ann in msg.get("annotations") or []:
+            if isinstance(ann, dict) and ann.get("type") == "audio_info":
+                detected_lang = ann.get("language")
+                break
+        return {
+            "transcript": (transcript or "").strip(),
+            "language": detected_lang or language or "",
+            "spans": [{"id": "s1", "speaker": "patient", "text": (transcript or "").strip(), "start_sec": 0.0, "end_sec": 0.0}],
         }
 
     async def summarize_visit(self, transcript: str, spans: List[Dict[str, Any]], lang: str = "en") -> Dict[str, Any]:

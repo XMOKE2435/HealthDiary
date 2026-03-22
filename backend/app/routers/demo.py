@@ -129,83 +129,93 @@ def demo_home(request: Request):
         <body>
           <header style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;">
             <div>
-              <h1 id="titleText">HealthDiary MVP Demo</h1>
-              <p id="subtitleText">Interactive symptom intake, detailed recommendations, and patient-ready visit preparation.</p>
-            </div>
-            <div style="flex-shrink:0;">
-              <button class="secondary" id="langToggleBtn" onclick="toggleLanguageMode()" title="Switch language / 切换语言" style="background:rgba(255,255,255,0.25);color:#fff;border:2px solid #fff;font-weight:600;padding:10px 16px;">
-                🌐 Language / 语言
-              </button>
-              <small style="display:block;color:rgba(255,255,255,0.85);margin-top:6px;">If you don't see this button, press Ctrl+Shift+R to refresh.</small>
+              <h1 id="titleText">HealthDiary MVP Demo / 健康日记示例</h1>
+              <p id="subtitleText">Interactive symptom intake, detailed recommendations, and patient-ready visit preparation. / 记录症状、获取建议、就诊准备。</p>
             </div>
           </header>
           <main>
           <div class="row">
             <div class="col">
               <div class="card">
-                <h3 id="card1Title">1) Symptom Entry (LLM chat → single saved entry)</h3>
-                <label>User ID</label>
+                <h3 id="card1Title">1) Symptom Entry / 症状记录 (LLM chat → single saved entry)</h3>
+                <label>User ID / 用户 ID</label>
                 <input id="userId" value="demo-user-1"/>
                 <div style="display:flex; gap:8px;">
                   <div style="flex:1;">
-                    <label>Date (YYYY-MM-DD)</label>
+                    <label>Date (YYYY-MM-DD) / 日期</label>
                     <input id="dateInput" type="date" />
                   </div>
                   <div style="flex:1;">
-                    <label>Time (24h, HH:MM)</label>
+                    <label>Time (24h, HH:MM) / 時間</label>
                     <input id="timeInput" type="time" />
                   </div>
                 </div>
                 <div id="chatBox" style="height:200px; overflow:auto; margin:10px 0;"></div>
-                <input id="chatInput" placeholder="Describe your symptom (you can start here)" />
+                <input id="chatInput" placeholder="Describe your symptom / 描述症状（中英文皆可）" />
                 <div style="display:flex; gap:8px; margin:8px 0; flex-wrap:wrap;">
-                  <button onclick="chatSend()">Send</button>
-                  <button class="secondary" onclick="chatReset()">Reset</button>
-                  <button class="secondary" id="voiceBtn" style="display:flex;align-items:center;gap:6px;" onclick="toggleVoice()">
-                    <span id="voiceIcon">🎙️</span><span id="voiceLabel">Voice Input</span>
+                  <button onclick="chatSend()">Send / 发送</button>
+                  <button class="secondary" onclick="chatReset()">Reset / 重置</button>
+                  <button class="secondary" id="backendAsrBtn" onclick="toggleSymptomBackendAsr()" title="Record then transcribe (Qwen3-ASR-Flash, auto language)">
+                    <span id="backendAsrIcon">🎤</span><span id="backendAsrLabel">Voice Input / 语音输入</span>
                   </button>
-                  <button class="secondary" onclick="uploadAudioForChat()" title="Upload audio file - works on Pi">📤 Upload Audio</button>
-                  <input type="file" id="chatAudioInput" accept="audio/*" style="display:none;" onchange="handleChatAudioUpload(event)">
-                  <button class="secondary" id="ttsBtn" onclick="toggleTts()">🔊 Voice On</button>
+                  <button class="secondary" id="ttsBtn" onclick="toggleTts()">🔊 Voice On / 语音朗读</button>
                 </div>
-                <small>Tip: The assistant asks one concise follow-up per turn; once enough info is collected, it auto-saves. You can type, use voice capture, or upload audio (works on Pi).</small>
+                <small>Tip: Reply follows your language. Type or use voice (auto-detects). / 回复与您同语言，可打字或语音。</small>
                 <pre id="diaryOut"></pre>
               </div>
 
               <div class="card">
-                <h3 id="card2Title">2) GET /recommendations</h3>
+                <h3 id="card2Title">2) GET /recommendations / 获取建议</h3>
                 <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px;">
-                  <button onclick="getRecs()">Fetch Recommendations</button>
-                  <button class="secondary" id="recsSpeakBtn" onclick="toggleRecsSpeech()" disabled>🔊 Play Recommendations</button>
+                  <button onclick="getRecs()">Fetch Recommendations / 获取建议</button>
+                  <button class="secondary" id="recsSpeakBtn" onclick="toggleRecsSpeech()" disabled>🔊 Play (EN) / 朗读（英文）</button>
                 </div>
                 <pre id="recsOut"></pre>
               </div>
 
               <div class="card">
-                <h3 id="card3Title">3) POST /doctor-pack</h3>
-                <button onclick="doctorPack()">Generate Doctor Pack</button>
+                <h3 id="card3Title">3) POST /doctor-pack / 就诊摘要</h3>
+                <button onclick="doctorPack()">Generate Doctor Pack / 生成就诊摘要</button>
                 <div id="packLinks"></div>
               </div>
             </div>
 
             <div class="col">
               <div class="card">
-                <h3 id="card4Title">4) Visit Capture (record + summary)</h3>
-                <div class="record-status" id="recordStatus">Microphone idle</div>
+                <h3 id="card4Title">4) Visit Capture / 门诊录音 (record + summary)</h3>
+                <div class="record-status" id="recordStatus">Microphone idle / 麦克风闲置</div>
                 <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;">
-                  <button id="recordBtn" onclick="startRecording()">Start Recording</button>
-                  <button class="secondary" id="stopRecordBtn" onclick="stopRecording()" disabled>Stop Recording</button>
-                  <button class="secondary" id="downloadBtn" onclick="downloadRecording()" disabled style="display:none;">Download Audio</button>
-                  <button class="secondary" id="uploadBtn" onclick="uploadRecording()">Upload / Select Audio</button>
+                  <button id="recordBtn" onclick="startRecording()">Start Recording / 开始录音</button>
+                  <button class="secondary" id="stopRecordBtn" onclick="stopRecording()" disabled>Stop Recording / 停止</button>
+                  <button class="secondary" id="downloadBtn" onclick="downloadRecording()" disabled style="display:none;">Download Audio / 下载</button>
+                  <button class="secondary" id="uploadBtn" onclick="uploadRecording()">Upload / Select Audio / 上传音频</button>
                   <input type="file" id="audioFileInput" accept="audio/*" style="display:none;" onchange="handleAudioFileUpload(event)">
                 </div>
-                <small>Chrome / Edge desktop only. Record audio, then download or upload for transcription.</small>
+                <small>Chrome / Edge. Record then upload for transcription. / 录音后上传转写。</small>
                 <div style="margin-top:18px;">
-                  <h4 style="margin:0 0 8px; font-size:16px; color:#0f172a;">Doctor instructions summary</h4>
-                  <pre id="sumOut">(no summary yet)</pre>
-                  <button class="secondary" id="transcriptToggle" style="display:none; margin-top:8px;" onclick="toggleTranscript()">Show full transcript</button>
+                  <h4 style="margin:0 0 8px; font-size:16px; color:#0f172a;">Doctor instructions summary / 医师嘱托摘要</h4>
+                  <pre id="sumOut">(no summary yet / 尚无摘要)</pre>
+                  <button class="secondary" id="transcriptToggle" style="display:none; margin-top:8px;" onclick="toggleTranscript()">Show full transcript / 显示全文</button>
                   <pre id="transOut" style="display:none; margin-top:10px;"></pre>
                 </div>
+              </div>
+
+              <div class="card">
+                <h3 id="card5Title">5) Meal Recording / 饮食记录</h3>
+                <label for="mealInput">Describe what you ate / 描述饮食：</label>
+                <textarea id="mealInput" rows="3" placeholder="e.g. This morning I had oatmeal... / 例如：早上吃了燕麥..."></textarea>
+                <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
+                <button onclick="logMeal()">Save Meal / 保存</button>
+                  <button class="secondary" id="mealBackendAsrBtn" onclick="toggleMealBackendAsr()" title="Record then transcribe (Qwen3-ASR-Flash)">
+                    <span id="mealBackendAsrIcon">🎤</span><span id="mealBackendAsrLabel">Voice Input / 语音输入</span>
+                  </button>
+                </div>
+                <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
+                  <button class="secondary" onclick="analyzeMeals()">Analyze last 30 days / 分析近30天</button>
+                  <button class="secondary" id="mealSpeakBtn" onclick="toggleMealSpeech()" disabled>🔊 Play (EN) / 朗读（英文）</button>
+                </div>
+                <small>Voice uses Qwen3-ASR-Flash, auto-detects. Play reads in English. / 语音自动辨识；朗读为英文。</small>
+                <pre id="mealOut"></pre>
               </div>
             </div>
           </div>
@@ -220,84 +230,24 @@ def demo_home(request: Request):
             };
             // Last recommendations text for manual playback
             window._recsSpeech = { text: '', active: false };
+            // Last meal analysis text for manual playback
+            window._mealSpeech = { text: '', active: false };
             // Visit capture state
             window._visitState = { recorder:null, chunks:[], stream:null, transcript:'', spans:[], summary:null, showTranscript:false, recordedBlob:null };
-            // Language mode state
-            window._langMode = 'ENGLISH';
+            // Meal recording state (simple)
+            window._mealState = { recorder:null, chunks:[], stream:null, recordedBlob:null };
+            // Default lang for visit transcribe etc. (UI is bilingual; chat uses reply_lang from backend)
             window._langCode = 'en';
-
-            async function loadLanguageMode(){
-              try{
-                const r = await fetch('/language-mode');
-                if(!r.ok) return;
-                const j = await r.json();
-                window._langMode = (j.mode_name || j.mode || 'ENGLISH').toUpperCase();
-                applyLanguageToUI();
-              }catch(e){
-                console.warn('Failed to load language mode', e);
-              }
-            }
-
-            function applyLanguageToUI(){
-              const mode = window._langMode || 'ENGLISH';
-              window._langCode = mode === 'CHINESE' ? 'zh' : 'en';
-              const title = document.getElementById('titleText');
-              const subtitle = document.getElementById('subtitleText');
-              const card1 = document.getElementById('card1Title');
-              const card2 = document.getElementById('card2Title');
-              const card3 = document.getElementById('card3Title');
-              const card4 = document.getElementById('card4Title');
-              const langBtn = document.getElementById('langToggleBtn');
-              if(mode === 'CHINESE'){
-                if(title) title.textContent = 'HealthDiary 示例（双语版）';
-                if(subtitle) subtitle.textContent = '记录症状、获取生活建议，并为就诊提前做好准备。';
-                if(card1) card1.textContent = '1）症状记录（聊天方式 → 自动保存一条记录）';
-                if(card2) card2.textContent = '2）获取生活方式建议（GET /recommendations）';
-                if(card3) card3.textContent = '3）生成就诊摘要（POST /doctor-pack）';
-                if(card4) card4.textContent = '4）门诊录音与总结（语音转写 + 嘱托摘要）';
-                if(langBtn) langBtn.textContent = '🌐 当前：中文（点击切换 English）';
-              }else{
-                if(title) title.textContent = 'HealthDiary MVP Demo';
-                if(subtitle) subtitle.textContent = 'Interactive symptom intake, detailed recommendations, and patient-ready visit preparation.';
-                if(card1) card1.textContent = '1) Symptom Entry (LLM chat → single saved entry)';
-                if(card2) card2.textContent = '2) GET /recommendations';
-                if(card3) card3.textContent = '3) POST /doctor-pack';
-                if(card4) card4.textContent = '4) Visit Capture (record + summary)';
-                if(langBtn) langBtn.textContent = '🌐 Language / 语言';
-              }
-            }
-
-            async function toggleLanguageMode(){
-              const current = window._langMode || 'ENGLISH';
-              const next = current === 'CHINESE' ? 'ENGLISH' : 'CHINESE';
-              try{
-                const r = await fetch('/language-mode', {
-                  method: 'POST',
-                  headers: {'Content-Type':'application/json'},
-                  body: JSON.stringify({mode: next})
-                });
-                if(r.ok){
-                  const j = await r.json();
-                  window._langMode = (j.mode_name || j.mode || next).toUpperCase();
-                  applyLanguageToUI();
-                }else{
-                  alert('Failed to switch language mode.');
-                }
-              }catch(e){
-                console.error('Language toggle error', e);
-                alert('Unable to switch language mode.');
-              }
-            }
             function updateTtsUI(){
               const btn = document.getElementById('ttsBtn');
               if(!btn) return;
               if(!window._tts.supported){
-                btn.textContent = '🔈 Voice not supported';
+                btn.textContent = '🔈 Voice not supported / 不支持';
                 btn.disabled = true;
                 btn.style.opacity = 0.6;
                 return;
               }
-              btn.textContent = window._tts.enabled ? '🔊 Voice On' : '🔇 Voice Off';
+              btn.textContent = window._tts.enabled ? '🔊 Voice On / 语音朗读' : '🔇 Voice Off / 关闭';
               btn.style.opacity = window._tts.enabled ? 1 : 0.65;
             }
             function toggleTts(){
@@ -312,11 +262,11 @@ def demo_home(request: Request):
               }
               updateTtsUI();
             }
-            function speak(text){
+            function speak(text, lang){
               if(!text || !window._tts.supported || !window._tts.enabled) return;
               try{
                 const utter = new SpeechSynthesisUtterance(text);
-                utter.lang = (window._langCode === 'zh') ? 'zh-CN' : 'en-US';
+                utter.lang = (lang === 'zh') ? 'zh-CN' : 'en-US';
                 utter.rate = 1;
                 window.speechSynthesis.cancel();
                 window.speechSynthesis.speak(utter);
@@ -326,7 +276,7 @@ def demo_home(request: Request):
             }
             function renderChat(){
               const box = document.getElementById('chatBox');
-              box.innerHTML = window._chat.messages.map(m => `<div><b>${m.role}:<\/b> ${m.text}<\/div>`).join('');
+              box.innerHTML = window._chat.messages.map(m => `<div><b>${m.role}:<\\/b> ${m.text}<\\/div>`).join('');
               box.scrollTop = box.scrollHeight;
             }
             function chatReset(){ window._chat = { messages: [], fields: {}, ready:false }; renderChat(); document.getElementById('diaryOut').innerText=''; }
@@ -349,21 +299,23 @@ def demo_home(request: Request):
               const ts = buildTs();
               const body = {user_id:userId, messages: window._chat.messages, fields: window._chat.fields, pathway:'abdominal_pain'};
               if (ts) body.ts = ts;
+              if (window._lastChatLang) body.lang = window._lastChatLang;
+              const prevLang = window._lastChatLang;
+              window._lastChatLang = null;
               const r = await fetch('/diary/chat/step', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
               const j = await r.json();
               window._chat.fields = j.fields || {};
               window._chat.ready = !!j.ready;
+              const replyLang = j.reply_lang || prevLang || 'en';
               if (j.clarifiers && j.clarifiers.length){
                 const q = j.clarifiers[0].question;
                 window._chat.messages.push({role:'assistant', text: q});
-                speak(q);
+                speak(q, replyLang);
               }
               if (j.saved_id){
-                const savedMsg = (window._langMode === 'CHINESE')
-                  ? '谢谢您的分享，我已经为您保存好了。祝您早日好起来。'
-                  : "Thanks for sharing. I've saved this for you. I hope you feel better soon.";
+                const savedMsg = j.saved_message || "Thanks for sharing. I've saved this for you. I hope you feel better soon.";
                 window._chat.messages.push({role:'assistant', text: savedMsg});
-                speak(savedMsg);
+                speak(savedMsg, replyLang);
               }
               renderChat();
               document.getElementById('diaryOut').innerText = JSON.stringify({fields: window._chat.fields, ready: window._chat.ready}, null, 2);
@@ -385,6 +337,175 @@ def demo_home(request: Request):
                 const hasText = !!spoken;
                 btn.disabled = !hasText || !window._tts.supported;
                 btn.textContent = hasText ? '🔊 Play Recommendations' : '🔊 Play Recommendations';
+              }
+            }
+
+            async function logMeal(){
+              const userId = document.getElementById('userId').value;
+              const text = (document.getElementById('mealInput').value || '').trim();
+              const out = document.getElementById('mealOut');
+              if(!text){
+                alert('Please describe what you ate.');
+                return;
+              }
+              out.innerText = '(saving meal...)';
+              try{
+                const res = await fetch('/meals/log', {
+                  method:'POST',
+                  headers:{'Content-Type':'application/json'},
+                  body: JSON.stringify({user_id:userId, text})
+                });
+                const j = await res.json();
+                if(!res.ok){
+                  out.innerText = 'Error: ' + (j.detail || JSON.stringify(j));
+                  return;
+                }
+                out.innerText = JSON.stringify(j, null, 2);
+                document.getElementById('mealInput').value = '';
+              }catch(e){
+                console.error('Meal log error', e);
+                out.innerText = 'Error: ' + e;
+              }
+            }
+
+            async function analyzeMeals(){
+              const userId = document.getElementById('userId').value;
+              const out = document.getElementById('mealOut');
+              out.innerText = '(analyzing meals...)';
+              try{
+                const res = await fetch(`/meals/summary?user_id=${encodeURIComponent(userId)}&window_days=30`);
+                const j = await res.json();
+                if(!res.ok){
+                  out.innerText = 'Error: ' + (j.detail || JSON.stringify(j));
+                  return;
+                }
+                out.innerText = JSON.stringify(j, null, 2);
+                // Prepare text for optional TTS playback
+                const analysis = j.analysis || {};
+                const suggs = Array.isArray(analysis.suggestions) ? analysis.suggestions : [];
+                const spoken = [analysis.summary || '']
+                  .concat(suggs.map(s => (s && s.text) ? s.text : (typeof s === 'string' ? s : '')).filter(Boolean))
+                  .filter(Boolean)
+                  .join('. ');
+                window._mealSpeech.text = spoken;
+                window._mealSpeech.active = false;
+                const btn = document.getElementById('mealSpeakBtn');
+                if(btn){
+                  const hasText = !!spoken;
+                  btn.disabled = !hasText || !window._tts.supported;
+                  btn.textContent = '🔊 Play Meal Analysis';
+                }
+              }catch(e){
+                console.error('Meal analysis error', e);
+                out.innerText = 'Error: ' + e;
+              }
+            }
+
+            function toggleMealSpeech(){
+              const btn = document.getElementById('mealSpeakBtn');
+              if(!btn) return;
+              const text = (window._mealSpeech && window._mealSpeech.text) || '';
+              if(!text){
+                alert('No meal analysis to read yet. Analyze meals first.');
+                return;
+              }
+              if(!window._tts.supported){
+                alert('Voice playback is not supported in this browser.');
+                return;
+              }
+              if(window._mealSpeech.active){
+                if(window.speechSynthesis){
+                  window.speechSynthesis.cancel();
+                }
+                window._mealSpeech.active = false;
+                btn.textContent = '🔊 Play Meal Analysis';
+                return;
+              }
+              speak(text, 'en');
+              window._mealSpeech.active = true;
+              btn.textContent = '⏹ Stop Audio';
+            }
+
+            // Backend ASR (Qwen3-ASR-Flash) for meal voice
+            window._mealBackendAsr = { recording: false, recorder: null, stream: null, chunks: [] };
+            async function toggleMealBackendAsr(){
+              const btn = document.getElementById('mealBackendAsrBtn');
+              const label = document.getElementById('mealBackendAsrLabel');
+              const icon = document.getElementById('mealBackendAsrIcon');
+              const out = document.getElementById('mealOut');
+              if(!btn || !label) return;
+              if(window._mealBackendAsr.recording){
+                const r = window._mealBackendAsr.recorder;
+                if(r && r.state !== 'inactive') r.stop();
+                window._mealBackendAsr.recording = false;
+                if(window._mealBackendAsr.stream) window._mealBackendAsr.stream.getTracks().forEach(t => t.stop());
+                window._mealBackendAsr.stream = null;
+                label.textContent = 'Voice Input';
+                icon.textContent = '🎤';
+                btn.style.background = '';
+                return;
+              }
+              if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || typeof MediaRecorder === 'undefined'){
+                if(out) out.innerText = 'Recording not supported in this browser.';
+                return;
+              }
+              try{
+                const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+                window._mealBackendAsr.stream = stream;
+                window._mealBackendAsr.chunks = [];
+                const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : undefined;
+                const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+                window._mealBackendAsr.recorder = recorder;
+                recorder.ondataavailable = (e) => { if(e.data && e.data.size > 0) window._mealBackendAsr.chunks.push(e.data); };
+                recorder.onstop = async () => {
+                  try{
+                    const blob = new Blob(window._mealBackendAsr.chunks, { type: recorder.mimeType || 'audio/webm' });
+                    window._mealBackendAsr.recorder = null;
+                    if(out) out.innerText = 'Transcribing...';
+                    label.textContent = 'Transcribing...';
+                    const userId = document.getElementById('userId').value;
+                    const fd = new FormData();
+                    fd.append('user_id', userId);
+                    fd.append('audio', blob, 'meal.webm');
+                    const resp = await fetch('/diary/transcribe', { method: 'POST', body: fd });
+                    const data = await resp.json();
+                    if(!resp.ok){
+                      if(out) out.innerText = 'Error: ' + (data.detail || resp.statusText);
+                      alert('Transcription failed: ' + (data.detail || resp.statusText));
+                      return;
+                    }
+                    const transcript = data.transcript || '';
+                    const lang = data.language || '';
+                    if(transcript){
+                      document.getElementById('mealInput').value = transcript;
+                      await logMeal();
+                      if(out) out.innerText = 'Saved. Detected language: ' + (lang || 'unknown');
+                      if(lang) console.log('Meal detected language:', lang);
+                    }else{
+                      if(out) out.innerText = 'No speech recognized. Try again.';
+                      alert('No speech recognized. Try again.');
+                    }
+                  }catch(err){
+                    console.error('Meal backend ASR error', err);
+                    if(out) out.innerText = 'Error: ' + (err.message || err);
+                    alert('Error: ' + (err.message || err));
+                  }finally{
+                    label.textContent = 'Voice Input';
+                    icon.textContent = '🎤';
+                    btn.style.background = '';
+                  }
+                };
+                recorder.start();
+                window._mealBackendAsr.recording = true;
+                label.textContent = 'Stop & transcribe';
+                icon.textContent = '⏹';
+                btn.style.background = '#fde68a';
+                btn.style.color = '#7c2d12';
+                if(out) out.innerText = 'Recording... click Stop & transcribe when done.';
+              }catch(err){
+                console.error('Meal mic error', err);
+                if(out) out.innerText = 'Could not access microphone.';
+                alert('Could not access microphone: ' + (err.message || err));
               }
             }
 
@@ -410,7 +531,7 @@ def demo_home(request: Request):
                 return;
               }
               // Start speaking
-              speak(text);
+              speak(text, 'en');
               window._recsSpeech.active = true;
               btn.textContent = '⏹ Stop Audio';
             }
@@ -658,189 +779,79 @@ def demo_home(request: Request):
               }
             }
 
-            // Voice input helpers (browser speech recognition)
-            window._voice = {
-              supported: ('SpeechRecognition' in window) || ('webkitSpeechRecognition' in window),
-              recognizer: null,
-              active: false
-            };
-            function updateVoiceUI(active, text){
-              const btn = document.getElementById('voiceBtn');
-              const label = document.getElementById('voiceLabel');
-              const icon = document.getElementById('voiceIcon');
-              if(!btn || !label || !icon) return;
-              if(!window._voice.supported){
-                label.textContent = 'Voice not supported';
-                icon.textContent = '⚠️';
-                btn.disabled = true;
+            // Backend ASR (Qwen3-ASR-Flash) for symptom voice
+            window._symptomBackendAsr = { recording: false, recorder: null, stream: null, chunks: [] };
+            async function toggleSymptomBackendAsr(){
+              const btn = document.getElementById('backendAsrBtn');
+              const label = document.getElementById('backendAsrLabel');
+              const icon = document.getElementById('backendAsrIcon');
+              if(!btn || !label) return;
+              if(window._symptomBackendAsr.recording){
+                const r = window._symptomBackendAsr.recorder;
+                if(r && r.state !== 'inactive') r.stop();
+                window._symptomBackendAsr.recording = false;
+                if(window._symptomBackendAsr.stream) window._symptomBackendAsr.stream.getTracks().forEach(t => t.stop());
+                window._symptomBackendAsr.stream = null;
+                label.textContent = 'Voice Input';
+                icon.textContent = '🎤';
+                btn.style.background = '';
                 return;
               }
-              if(active){
-                label.textContent = text || 'Listening...';
-                icon.textContent = '🔴';
+              if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || typeof MediaRecorder === 'undefined'){
+                alert('Recording not supported in this browser.');
+                return;
+              }
+              try{
+                const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+                window._symptomBackendAsr.stream = stream;
+                window._symptomBackendAsr.chunks = [];
+                const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : undefined;
+                const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+                window._symptomBackendAsr.recorder = recorder;
+                recorder.ondataavailable = (e) => { if(e.data && e.data.size > 0) window._symptomBackendAsr.chunks.push(e.data); };
+                recorder.onstop = async () => {
+                  try{
+                    const blob = new Blob(window._symptomBackendAsr.chunks, { type: recorder.mimeType || 'audio/webm' });
+                    window._symptomBackendAsr.recorder = null;
+                    document.getElementById('backendAsrLabel').textContent = 'Transcribing...';
+                    const userId = document.getElementById('userId').value;
+                    const fd = new FormData();
+                    fd.append('user_id', userId);
+                    fd.append('audio', blob, 'symptom.webm');
+                    const resp = await fetch('/diary/transcribe', { method: 'POST', body: fd });
+                    const data = await resp.json();
+                    if(!resp.ok){
+                      alert('Transcription failed: ' + (data.detail || resp.statusText));
+                      return;
+                    }
+                    const transcript = data.transcript || '';
+                    const lang = data.language || '';
+                    if(transcript){
+                      document.getElementById('chatInput').value = transcript;
+                      window._lastChatLang = (lang === 'zh' || lang === 'yue') ? 'zh' : (lang || 'en');
+                      chatSend(transcript);
+                      if(lang) console.log('Detected language:', lang);
+                    }else{
+                      alert('No speech recognized. Try again.');
+                    }
+                  }catch(err){
+                    console.error('Backend ASR error', err);
+                    alert('Error: ' + (err.message || err));
+                  }finally{
+                    document.getElementById('backendAsrLabel').textContent = 'Voice Input';
+                    document.getElementById('backendAsrIcon').textContent = '🎤';
+                    document.getElementById('backendAsrBtn').style.background = '';
+                  }
+                };
+                recorder.start();
+                window._symptomBackendAsr.recording = true;
+                label.textContent = 'Stop & transcribe';
+                icon.textContent = '⏹';
                 btn.style.background = '#fde68a';
                 btn.style.color = '#7c2d12';
-              }else{
-                label.textContent = text || 'Voice Input';
-                icon.textContent = '🎙️';
-                btn.style.background = '';
-                btn.style.color = '';
-              }
-            }
-            function initSpeechRecognizer(){
-              if(!window._voice.supported) return null;
-              if(window._voice.recognizer) return window._voice.recognizer;
-              const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-              const rec = new SR();
-              rec.lang = (window._langCode === 'zh') ? 'zh-CN' : 'en-US';
-              rec.interimResults = false;
-              rec.maxAlternatives = 1;
-              rec.onresult = (event) => {
-                const transcript = event.results?.[0]?.[0]?.transcript || '';
-                if(transcript){
-                  document.getElementById('chatInput').value = transcript;
-                  chatSend(transcript);
-                }
-              };
-              rec.onerror = (event) => {
-                console.error('Voice error', event);
-                const errMsg = event.error || 'unknown';
-                updateVoiceUI(false, 'Try again');
-                // More helpful error messages
-                let userMsg = "Voice capture error: " + errMsg;
-                if(errMsg === 'network'){
-                  userMsg = "Network error: Speech recognition cannot reach the cloud service.\\n\\n" +
-                    "On Raspberry Pi, Chromium often has this bug even when internet and mic work.\\n\\n" +
-                    "Try:\\n" +
-                    "1. Use Firefox on the Pi (sudo apt install firefox-esr), or\\n" +
-                    "2. Open this page on your laptop (e.g. http://YOUR-PI-IP:8000/demo) and use Voice Input there, or\\n" +
-                    "3. Use the \\"Upload / Select Audio\\" or \\"Start Recording\\" in section 4 (Visit Capture) and upload/record there - that uses your backend, not the browser API.";
-                }else if(errMsg === 'audio-capture' || errMsg === 'not-allowed'){
-                  const isInsecure = location.protocol === 'http:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1';
-                  userMsg = "Microphone blocked (not-allowed).\\n\\n" +
-                    (isInsecure
-                      ? "You are viewing this page over HTTP from an IP address. Browsers block microphone access unless the page is served via HTTPS or from localhost.\\n\\n" +
-                        "Options:\\n" +
-                        "1. On the machine where the server runs: open http://127.0.0.1:8000/demo and try Voice Input there.\\n" +
-                        "2. Set up HTTPS for this server and open https://... instead of http://...\\n" +
-                        "3. Use \\"Upload / Select Audio\\" or \\"Start Recording\\" in section 4 (Visit Capture) - those use your backend, not the browser mic."
-                      : "Grant microphone permission when the browser asks, or check site settings (address bar) and allow microphone for this site.");
-                }else if(errMsg === 'no-speech'){
-                  userMsg = "No speech detected. Speak louder or check microphone.";
-                }
-                alert(userMsg);
-              };
-              rec.onend = () => {
-                window._voice.active = false;
-                updateVoiceUI(false);
-              };
-              window._voice.recognizer = rec;
-              return rec;
-            }
-            function toggleVoice(){
-              if(!window._voice.supported){
-                alert('Voice input not supported in this browser. Please use the latest Chrome or Edge on desktop.');
-                updateVoiceUI(false, 'Not supported');
-                return;
-              }
-              // Browsers block microphone on non-secure contexts (HTTP from IP; only HTTPS or localhost allowed)
-              const isInsecure = location.protocol === 'http:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1';
-              if(isInsecure){
-                alert("Voice Input is blocked when the page is opened over HTTP from an IP address (e.g. http://192.168.x.x:8000/demo).\\n\\n" +
-                  "To use Voice Input:\\n" +
-                  "- On the Pi: open http://127.0.0.1:8000/demo in the browser on the Pi.\\n" +
-                  "- Or set up HTTPS and open https://...\\n\\n" +
-                  "Alternatively use section 4 (Visit Capture) - Start Recording or Upload - which uses your backend.");
-                updateVoiceUI(false, "Blocked (use 127.0.0.1 or HTTPS)");
-                return;
-              }
-              const rec = initSpeechRecognizer();
-              if(!rec) return;
-              if(window._voice.active){
-                rec.stop();
-                window._voice.active = false;
-                updateVoiceUI(false);
-                return;
-              }
-              try{
-                rec.start();
-                window._voice.active = true;
-                updateVoiceUI(true);
               }catch(err){
-                console.error('Unable to start voice', err);
-                let msg = 'Unable to access microphone. ';
-                if(err.name === 'NotAllowedError' || err.message?.includes('permission')){
-                  msg += 'Please grant microphone permission in browser settings (lock icon in address bar).';
-                }else{
-                  msg += 'Check browser permissions and microphone connection.';
-                }
-                alert(msg);
-                updateVoiceUI(false, 'Unavailable');
-              }
-            }
-
-            // Audio upload for section 1 (chat) - uses backend, works on Pi
-            function uploadAudioForChat(){
-              document.getElementById('chatAudioInput').click();
-            }
-
-            function handleChatAudioUpload(event){
-              const file = event.target.files?.[0];
-              if(!file){
-                return;
-              }
-              const mime = file.type || '';
-              if(mime && !(mime.startsWith('audio/') || mime.startsWith('video/'))){
-                alert('Please select an audio or video file.');
-                return;
-              }
-              transcribeAndSendToChat(file);
-              event.target.value = '';
-            }
-
-            async function transcribeAndSendToChat(blob){
-              if(!blob || blob.size === 0){
-                alert('No audio file selected.');
-                return;
-              }
-              if(blob.size < 100){
-                alert('Audio file too short. Please select a file with at least a few seconds of audio.');
-                return;
-              }
-              const userId = document.getElementById('userId').value;
-              const fd = new FormData();
-              fd.append('user_id', userId);
-              fd.append('lang', window._langCode || 'en');
-              fd.append('audio', blob, 'chat-audio.webm');
-              
-              // Show loading state
-              const chatInput = document.getElementById('chatInput');
-              const originalPlaceholder = chatInput.placeholder;
-              chatInput.placeholder = 'Transcribing audio...';
-              chatInput.disabled = true;
-              
-              try{
-                const resp = await fetch('/visit/transcribe', { method:'POST', body: fd});
-                const data = await resp.json();
-                if(!resp.ok){
-                  const detail = data.detail || data.message || 'Transcription failed';
-                  throw new Error(detail);
-                }
-                const transcript = data.transcript || data.text || '';
-                if(!transcript.trim()){
-                  alert('No transcript received. Please try again or speak more clearly.');
-                  return;
-                }
-                // Fill chat input and send automatically
-                chatInput.value = transcript.trim();
-                chatInput.disabled = false;
-                chatInput.placeholder = originalPlaceholder;
-                chatSend(transcript.trim());
-              }catch(err){
-                console.error('Audio transcription error', err);
-                chatInput.disabled = false;
-                chatInput.placeholder = originalPlaceholder;
-                alert('Failed to transcribe audio: ' + (err.message || err));
+                console.error('Mic error', err);
+                alert('Could not access microphone: ' + (err.message || err));
               }
             }
 
@@ -860,9 +871,7 @@ def demo_home(request: Request):
             // Initialize button state on load
             try {
               setDefaultDateTime();
-              updateVoiceUI(false);
               updateTtsUI();
-              loadLanguageMode();
               resetVisitView();
               console.log('HealthDiary demo script loaded');
             }catch(e){
