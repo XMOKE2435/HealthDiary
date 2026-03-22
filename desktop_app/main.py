@@ -37,9 +37,9 @@ class TtsWorker:
     """TTS on a background thread.
 
     - **Windows:** ``pyttsx3`` (SAPI) with COM init + fresh engine per phrase.
-    - **Linux / Pi:** ``pyttsx3`` if it initializes; otherwise **eSpeak-NG** or **spd-say**
-      (subprocess). GUI launches often have a minimal ``PATH``; we also check ``/usr/bin/...``
-      directly. Install: ``sudo apt install espeak-ng`` and/or ``speech-dispatcher``.
+    - **Linux / Pi:** Prefer **eSpeak-NG** piped to **aplay** on a fixed ALSA device (see
+      ``_linux_playback_device``), then ``spd-say``, then ``pyttsx3``. GUI launches often have a
+      minimal ``PATH``; we also check ``/usr/bin/...`` directly.
     """
 
     _STOP = "__tts_stop__"
@@ -52,9 +52,13 @@ class TtsWorker:
         self._init_ok = False
         self._backend = "none"  # "pyttsx3" | "espeak" | "spd_say"
         self._linux_tts_bin: Optional[str] = None
+        # ALSA plug device for Pi I2S (e.g. MAX98357A); adjust if aplay -l shows a different card.
+        self._linux_playback_device = "plughw:2,0"
         self._active_lock = threading.Lock()
         self._active_eng: Any = None
         self._active_proc: Optional[subprocess.Popen] = None
+        # When espeak --stdout | aplay, keep the writer so stop() can kill both ends.
+        self._active_pipe_src: Optional[subprocess.Popen] = None
 
     def ensure_started(self) -> bool:
         if self._thread is not None:
@@ -111,59 +115,96 @@ class TtsWorker:
         with self._active_lock:
             eng = self._active_eng
             proc = self._active_proc
+            pipe_src = self._active_pipe_src
             self._active_eng = None
             self._active_proc = None
+            self._active_pipe_src = None
         if eng is not None:
             try:
                 eng.stop()
             except Exception:
                 pass
-        if proc is not None:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-            try:
-                proc.kill()
-            except Exception:
-                pass
+        for p in (pipe_src, proc):
+            if p is not None:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+                try:
+                    p.kill()
+                except Exception:
+                    pass
 
     def _speak_linux_cli(self, text: str, lang: str) -> None:
         if not self._linux_tts_bin:
             return
+
         lc = (lang or "en").lower().strip()
-        proc: Optional[subprocess.Popen] = None
+        espeak_proc: Optional[subprocess.Popen] = None
+        aplay_proc: Optional[subprocess.Popen] = None
+
         try:
             if self._backend == "espeak":
-                cmd: List[str] = [self._linux_tts_bin, "-s", "150"]
+                cmd: List[str] = [self._linux_tts_bin, "--stdout", "-s", "150"]
                 if lc.startswith("zh"):
                     cmd.extend(["-v", "zh"])
                 else:
                     cmd.extend(["-v", "en"])
                 cmd.append(text)
-                proc = subprocess.Popen(
+
+                espeak_proc = subprocess.Popen(
                     cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+
+                aplay_proc = subprocess.Popen(
+                    ["aplay", "-D", self._linux_playback_device],
+                    stdin=espeak_proc.stdout,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
+
+                with self._active_lock:
+                    self._active_proc = aplay_proc
+                    self._active_pipe_src = espeak_proc
+
+                if espeak_proc.stdout is not None:
+                    espeak_proc.stdout.close()
+
+                aplay_proc.wait()
+                espeak_proc.wait()
+
             elif self._backend == "spd_say":
                 lang_tag = "zh" if lc.startswith("zh") else "en"
-                proc = subprocess.Popen(
+                aplay_proc = subprocess.Popen(
                     [self._linux_tts_bin, "-l", lang_tag, text],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
+                with self._active_lock:
+                    self._active_proc = aplay_proc
+                aplay_proc.wait()
+
             else:
                 return
-            with self._active_lock:
-                self._active_proc = proc
-            proc.wait()
-        except Exception:
-            pass
+
+        except Exception as e:
+            print(f"[TTS] Linux CLI playback failed: {e}", flush=True)
+
         finally:
             with self._active_lock:
-                if self._active_proc is proc:
+                if self._active_proc is aplay_proc:
                     self._active_proc = None
+                if self._active_pipe_src is espeak_proc:
+                    self._active_pipe_src = None
+
+            for proc in (aplay_proc, espeak_proc):
+                if proc is not None and proc.poll() is None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
 
     def _loop(self) -> None:
         try:
@@ -176,19 +217,34 @@ class TtsWorker:
                     pass
 
             self._backend = "none"
-            try:
-                probe = pyttsx3.init()
-                del probe
-                self._backend = "pyttsx3"
-                self._init_ok = True
-            except Exception:
+            if sys.platform != "win32":
                 kind, path = self._pick_linux_cli_tts()
                 if kind != "none" and path:
                     self._backend = kind
                     self._linux_tts_bin = path
                     self._init_ok = True
                 else:
+                    try:
+                        probe = pyttsx3.init()
+                        del probe
+                        self._backend = "pyttsx3"
+                        self._init_ok = True
+                    except Exception:
+                        self._init_ok = False
+            else:
+                try:
+                    probe = pyttsx3.init()
+                    del probe
+                    self._backend = "pyttsx3"
+                    self._init_ok = True
+                except Exception:
                     self._init_ok = False
+
+            print(
+                f"[TTS] backend={self._backend}, bin={self._linux_tts_bin!r}, "
+                f"device={getattr(self, '_linux_playback_device', '')!r}",
+                flush=True,
+            )
 
             # Wake GUI immediately after probe (success or failure). Must always run.
             self._started.set()
@@ -1133,7 +1189,8 @@ class MainWindow(QMainWindow):
         if not text or not self._tts_supported or not self._tts_enabled:
             return
         try:
-            # TTS worker: pyttsx3 (Windows) or espeak-ng (Linux/Pi); pass lang for voice selection.
+            print(f"[TTS] speaking: lang={lang}, text={text[:60]!r}", flush=True)
+            # TTS worker: pyttsx3 (Windows) or espeak→aplay (Linux/Pi); pass lang for voice selection.
             if self._tts_worker.speak(text, lang):
                 self._tts_active_source = source
             self._update_recs_tts_button()
