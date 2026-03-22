@@ -42,13 +42,13 @@ Native desktop application built with **Python + PySide6 (Qt)**. Uses the Pi’s
 
 The app tries **pyttsx3** first; on many Pis that fails even when the speaker works with `aplay`. In that case it uses **eSpeak-NG** (same ALSA path as normal playback).
 
-Install on Debian / Raspberry Pi OS:
+Install on Debian / Raspberry Pi OS (either is enough; both is fine):
 
 ```bash
-sudo apt update && sudo apt install -y espeak-ng
+sudo apt update && sudo apt install -y espeak-ng speech-dispatcher
 ```
 
-Test: `espeak-ng "hello"` should play on your speaker (e.g. MAX98357A I2S). If that works, the in-app **Voice** button should work too.
+Test: `espeak-ng "hello"` should play on your speaker. If the app still says voice is unsupported, launch it from a terminal once — some desktop shortcuts use a minimal `PATH` and miss `/usr/bin`; the app now prepends `/usr/bin` and checks those paths directly.
 
 ---
 

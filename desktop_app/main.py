@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """HealthDairy desktop app – native UI (PySide6). Uses backend for all features."""
 import io
+import os
 import queue
 import shutil
 import subprocess
@@ -36,9 +37,9 @@ class TtsWorker:
     """TTS on a background thread.
 
     - **Windows:** ``pyttsx3`` (SAPI) with COM init + fresh engine per phrase.
-    - **Linux / Pi:** ``pyttsx3`` if it initializes; otherwise **eSpeak-NG** via subprocess
-      (uses ALSA like ``aplay``). Pi often has working I2S/USB audio but no pyttsx3 driver —
-      install ``sudo apt install espeak-ng`` so ``espeak-ng`` is on ``PATH``.
+    - **Linux / Pi:** ``pyttsx3`` if it initializes; otherwise **eSpeak-NG** or **spd-say**
+      (subprocess). GUI launches often have a minimal ``PATH``; we also check ``/usr/bin/...``
+      directly. Install: ``sudo apt install espeak-ng`` and/or ``speech-dispatcher``.
     """
 
     _STOP = "__tts_stop__"
@@ -49,8 +50,8 @@ class TtsWorker:
         self._thread: Optional[threading.Thread] = None
         self._started = threading.Event()
         self._init_ok = False
-        self._backend = "none"  # "pyttsx3" | "espeak"
-        self._espeak_bin: Optional[str] = None
+        self._backend = "none"  # "pyttsx3" | "espeak" | "spd_say"
+        self._linux_tts_bin: Optional[str] = None
         self._active_lock = threading.Lock()
         self._active_eng: Any = None
         self._active_proc: Optional[subprocess.Popen] = None
@@ -63,12 +64,48 @@ class TtsWorker:
         self._started.wait(timeout=10.0)
         return self._init_ok
 
-    def _pick_espeak(self) -> Optional[str]:
-        for name in ("espeak-ng", "espeak"):
-            p = shutil.which(name)
-            if p:
-                return p
-        return None
+    @staticmethod
+    def _ensure_unix_path() -> None:
+        """Desktop .desktop launches on Pi often omit /usr/bin; espeak-ng lives there."""
+        if sys.platform == "win32":
+            return
+        path = os.environ.get("PATH", "")
+        parts = path.split(os.pathsep) if path else []
+        for extra in ("/usr/local/bin", "/usr/bin", "/bin"):
+            if extra not in parts:
+                os.environ["PATH"] = extra + os.pathsep + os.environ.get("PATH", "")
+
+    @staticmethod
+    def _is_executable(path: str) -> bool:
+        return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
+
+    def _pick_linux_cli_tts(self) -> tuple[str, str]:
+        """Return (backend, abspath) or ('none', '')."""
+        self._ensure_unix_path()
+        candidates: List[tuple[str, List[str]]] = [
+            (
+                "espeak",
+                [
+                    shutil.which("espeak-ng") or "",
+                    shutil.which("espeak") or "",
+                    "/usr/bin/espeak-ng",
+                    "/usr/bin/espeak",
+                    "/bin/espeak-ng",
+                ],
+            ),
+            (
+                "spd_say",
+                [
+                    shutil.which("spd-say") or "",
+                    "/usr/bin/spd-say",
+                ],
+            ),
+        ]
+        for kind, paths in candidates:
+            for p in paths:
+                if self._is_executable(p):
+                    return (kind, p)
+        return ("none", "")
 
     def _interrupt_playback(self) -> None:
         with self._active_lock:
@@ -91,23 +128,33 @@ class TtsWorker:
             except Exception:
                 pass
 
-    def _speak_espeak(self, text: str, lang: str) -> None:
-        if not self._espeak_bin:
+    def _speak_linux_cli(self, text: str, lang: str) -> None:
+        if not self._linux_tts_bin:
             return
         lc = (lang or "en").lower().strip()
-        cmd: List[str] = [self._espeak_bin, "-s", "150"]
-        if lc.startswith("zh"):
-            cmd.extend(["-v", "zh"])
-        else:
-            cmd.extend(["-v", "en"])
-        cmd.append(text)
         proc: Optional[subprocess.Popen] = None
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            if self._backend == "espeak":
+                cmd: List[str] = [self._linux_tts_bin, "-s", "150"]
+                if lc.startswith("zh"):
+                    cmd.extend(["-v", "zh"])
+                else:
+                    cmd.extend(["-v", "en"])
+                cmd.append(text)
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            elif self._backend == "spd_say":
+                lang_tag = "zh" if lc.startswith("zh") else "en"
+                proc = subprocess.Popen(
+                    [self._linux_tts_bin, "-l", lang_tag, text],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                return
             with self._active_lock:
                 self._active_proc = proc
             proc.wait()
@@ -119,73 +166,79 @@ class TtsWorker:
                     self._active_proc = None
 
     def _loop(self) -> None:
-        if sys.platform == "win32":
-            try:
-                import pythoncom  # type: ignore[import-untyped]
-
-                pythoncom.CoInitialize()
-            except Exception:
-                pass
-
-        self._backend = "none"
         try:
-            probe = pyttsx3.init()
-            del probe
-            self._backend = "pyttsx3"
-            self._init_ok = True
-        except Exception:
-            self._espeak_bin = self._pick_espeak()
-            if self._espeak_bin:
-                self._backend = "espeak"
-                self._init_ok = True
-            else:
-                self._init_ok = False
+            if sys.platform == "win32":
+                try:
+                    import pythoncom  # type: ignore[import-untyped]
 
-        self._started.set()
-        if not self._init_ok:
-            return
+                    pythoncom.CoInitialize()
+                except Exception:
+                    pass
 
-        while True:
-            item = self._q.get()
-            if item is self._SHUTDOWN:
-                break
-            if item == self._STOP:
-                self._interrupt_playback()
-                continue
-
-            text: str
-            lang: str = "en"
-            if isinstance(item, tuple) and len(item) >= 2 and item[0] == "say":
-                text = str(item[1])
-                lang = str(item[2]) if len(item) > 2 else "en"
-            else:
-                text = str(item)
-
-            if self._backend == "espeak":
-                self._speak_espeak(text, lang)
-                continue
-
-            eng = None
+            self._backend = "none"
             try:
-                eng = pyttsx3.init()
-                with self._active_lock:
-                    self._active_eng = eng
-                eng.say(text)
-                eng.runAndWait()
+                probe = pyttsx3.init()
+                del probe
+                self._backend = "pyttsx3"
+                self._init_ok = True
             except Exception:
-                pass
-            finally:
-                with self._active_lock:
-                    self._active_eng = None
-                if eng is not None:
-                    try:
-                        eng.stop()
-                    except Exception:
-                        pass
-                    try:
-                        del eng
-                    except Exception:
-                        pass
+                kind, path = self._pick_linux_cli_tts()
+                if kind != "none" and path:
+                    self._backend = kind
+                    self._linux_tts_bin = path
+                    self._init_ok = True
+                else:
+                    self._init_ok = False
+
+            # Wake GUI immediately after probe (success or failure). Must always run.
+            self._started.set()
+            if not self._init_ok:
+                return
+
+            while True:
+                item = self._q.get()
+                if item is self._SHUTDOWN:
+                    break
+                if item == self._STOP:
+                    self._interrupt_playback()
+                    continue
+
+                text: str
+                lang: str = "en"
+                if isinstance(item, tuple) and len(item) >= 2 and item[0] == "say":
+                    text = str(item[1])
+                    lang = str(item[2]) if len(item) > 2 else "en"
+                else:
+                    text = str(item)
+
+                if self._backend in ("espeak", "spd_say"):
+                    self._speak_linux_cli(text, lang)
+                    continue
+
+                eng = None
+                try:
+                    eng = pyttsx3.init()
+                    with self._active_lock:
+                        self._active_eng = eng
+                    eng.say(text)
+                    eng.runAndWait()
+                except Exception:
+                    pass
+                finally:
+                    with self._active_lock:
+                        self._active_eng = None
+                    if eng is not None:
+                        try:
+                            eng.stop()
+                        except Exception:
+                            pass
+                        try:
+                            del eng
+                        except Exception:
+                            pass
+        finally:
+            if not self._started.is_set():
+                self._started.set()
 
     def speak(self, text: str, lang: str = "en") -> bool:
         if not text.strip():
