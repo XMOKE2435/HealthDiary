@@ -133,6 +133,37 @@ async def diary_chat_step(req: ChatStepRequest):
     reply_lang = _normalize_reply_lang(req.lang, last_user_text)
 
     llm = QwenClient()
+    pathway = (req.pathway or "abdominal_pain").strip().lower()
+    if pathway == "companion":
+        user_turn_count = sum(1 for m in req.messages if m.role == "user")
+        max_rounds = 5
+        try:
+            reply_text = await llm.companion_reply(
+                [m.model_dump() for m in req.messages],
+                reply_lang=reply_lang,
+                user_turn_count=user_turn_count,
+                max_rounds=max_rounds,
+            )
+        except RuntimeError as e:
+            if "not configured" in str(e).lower():
+                raise HTTPException(
+                    status_code=503,
+                    detail="LLM not configured. Set QWEN_ENDPOINT and QWEN_API_KEY in ~/HealthDiary/.env and restart the server.",
+                ) from e
+            raise
+        except Exception as e:
+            log.warning("companion_reply failed: %s", e, exc_info=True)
+            raise HTTPException(status_code=503, detail=f"LLM request failed: {e!s}") from e
+        return {
+            "fields": {},
+            "clarifiers": [{"id": "companion.reply", "question": reply_text}],
+            "ready": False,
+            "saved_id": None,
+            "saved_message": None,
+            "reply_lang": reply_lang,
+            "companion_done": bool(user_turn_count >= max_rounds),
+        }
+
     # Canonicalize to English for understanding (single canonical language)
     canonical_en = await llm.canonicalize_to_english(last_user_text)
     nlu = await llm.nlu_slot_fill(canonical_en)

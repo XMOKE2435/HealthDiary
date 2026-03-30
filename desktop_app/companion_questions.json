@@ -1,0 +1,106 @@
+{
+  "version": 1,
+  "description": "Warm check-in prompts for seniors in Singapore (bilingual zh/en).",
+  "questions": [
+    {
+      "zh": "早安，今天身体还舒坦吗？",
+      "en": "Good morning—how are you feeling in yourself today?"
+    },
+    {
+      "zh": "今天有没有喝够水、吃顿暖胃的早餐呀？",
+      "en": "Have you had enough water and a comforting breakfast today?"
+    },
+    {
+      "zh": "最近天气热，出门有没有带伞、小心中暑哦。",
+      "en": "It’s been warm—did you bring an umbrella or stay cool when you went out?"
+    },
+    {
+      "zh": "今天有去巴刹或熟食中心逛逛吗？看到什么喜欢的菜？",
+      "en": "Did you pop by the market or hawker centre—see anything tasty?"
+    },
+    {
+      "zh": "昨晚睡得好吗？半夜有没有醒过来？",
+      "en": "How was sleep—any wake-ups in the night?"
+    },
+    {
+      "zh": "午饭有没有吃饱？会不会太油或太咸？",
+      "en": "Did lunch fill you up—was anything too oily or salty?"
+    },
+    {
+      "zh": "下午有没有小歇一会儿，听听歌或看看电视？",
+      "en": "Did you rest a bit this afternoon—maybe some music or TV?"
+    },
+    {
+      "zh": "今天家人或朋友有打电话来聊天吗？",
+      "en": "Did family or a friend ring for a chat today?"
+    },
+    {
+      "zh": "晚上准备吃什么？有没有想吃的家常菜？",
+      "en": "What are you thinking for dinner—any home-style dish you fancy?"
+    },
+    {
+      "zh": "今天心情怎么样？有没有什么想跟人分享的小事？",
+      "en": "How’s your mood—anything small you’d like to share?"
+    },
+    {
+      "zh": "楼下的邻里或保安大哥今天有没有跟你打招呼？",
+      "en": "Did a neighbour or the friendly guard downstairs say hello today?"
+    },
+    {
+      "zh": "坐巴士或地铁出门还顺利吗？有没有位子坐？",
+      "en": "Was the bus or MRT ride alright—did you get a seat?"
+    },
+    {
+      "zh": "公园里有没有看到你常去坐坐的那张凳子？",
+      "en": "Did you see your usual bench at the park?"
+    },
+    {
+      "zh": "今天有没有吃一点水果，比如香蕉、苹果或木瓜？",
+      "en": "Any fruit today—banana, apple, or papaya maybe?"
+    },
+    {
+      "zh": "最近追的连续剧或新闻，有什么印象深的？",
+      "en": "Anything from your shows or the news that stuck with you?"
+    },
+    {
+      "zh": "家里窗门通风还好吗？空气清不清新？",
+      "en": "Is the home airing well—does the air feel fresh?"
+    },
+    {
+      "zh": "有没有记得按时吃医生开的药？需要我陪你念一次药名吗？",
+      "en": "Have medicines been on time today? (I’m only asking—no changes without your doctor.)"
+    },
+    {
+      "zh": "今天有没有哪里酸酸的、紧紧的，想轻轻活动一下？",
+      "en": "Any stiff or tight spots—a little gentle movement might feel nice."
+    },
+    {
+      "zh": "想喝一杯温温的茶还是薏米水？",
+      "en": "Fancy a warm tea or barley water?"
+    },
+    {
+      "zh": "傍晚有没有看到晚霞或凉一点的风？",
+      "en": "Did you catch a cooler breeze or a bit of sunset?"
+    },
+    {
+      "zh": "有没有想跟好久没见的朋友发条信息？",
+      "en": "Anyone you’d like to text—you haven’t caught up in a while?"
+    },
+    {
+      "zh": "今天有没有笑一笑？哪怕是一件小事也好。",
+      "en": "Did something make you smile today, even a little thing?"
+    },
+    {
+      "zh": "周末有没有打算去哪个熟悉的地方走走？",
+      "en": "Any familiar place you might visit on the weekend?"
+    },
+    {
+      "zh": "电视或收音机里，有没有听到喜欢的老歌？",
+      "en": "Hear any favourite songs on TV or the radio?"
+    },
+    {
+      "zh": "晚上睡觉空调或风扇会不会太冷？被子够暖吗？",
+      "en": "Is the fan or AC too cool at night—are the blankets enough?"
+    }
+  ]
+}

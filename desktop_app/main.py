@@ -9,16 +9,21 @@ import sys
 import threading
 import time
 import wave
-from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from datetime import date, datetime, timezone
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pyttsx3
 import sounddevice as sd
-from PySide6.QtCore import QObject, QSettings, QThread, QTimer, Signal
+from PySide6.QtCore import QObject, QSettings, QThread, QTime, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QFormLayout,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -26,11 +31,13 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QTabWidget,
+    QTimeEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from api import BackendClient
+from companion_pool import load_question_pool, pick_question
 
 
 class TtsWorker:
@@ -346,6 +353,8 @@ def record_wav_seconds(seconds: float) -> bytes:
 
 
 CHAT_RECORD_MAX_SEC = 3.0
+# Visit / doctor–patient conversation: cap to avoid runaway memory; user stops earlier.
+VISIT_RECORD_MAX_SEC = 7200.0
 
 
 def _maybe_boost_wav_int16_mono(wav_bytes: bytes, peak_below: int = 2800, target_peak: int = 11000) -> bytes:
@@ -437,15 +446,19 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("HealthDairy / 健康日记")
-        # Give more space so bilingual tab labels fit without immediate resizing
-        self.setMinimumSize(900, 650)
-        self.resize(1100, 750)
+        # Wider default so bilingual tab labels fit without horizontal scrolling
+        self.setMinimumSize(1280, 700)
+        self.resize(1520, 880)
 
         # State
         self._messages: List[Dict[str, str]] = []
         self._fields: Dict[str, Any] = {}
         self._client: Optional[BackendClient] = None
         self._visit_audio: Optional[bytes] = None
+        self._visit_upload_filename: str = "audio.wav"
+        self._visit_upload_content_type: str = "audio/wav"
+        self._visit_recording: bool = False
+        self._visit_rec_stop_event = threading.Event()
         self._worker_threads: List[tuple] = []  # (QThread, Worker) refs so they aren't GC'd
         self._tts_worker = TtsWorker()
         self._tts_supported = False
@@ -456,6 +469,14 @@ class MainWindow(QMainWindow):
         self._app_busy: bool = False
         self._chat_recording: bool = False
         self._chat_rec_stop_event = threading.Event()
+        self._chat_pathway: str = "abdominal_pain"
+        self._companion_plan_date: Optional[date] = None
+        self._companion_fired_slots: Set[int] = set()
+        self._companion_schedule: List[Tuple[int, int]] = []
+        self._companion_pool: List[str] = []
+        self._companion_last_question: str = ""
+        self._companion_cfg_widgets: List[QWidget] = []
+        self._companion_defer_counts: Dict[int, int] = {}
 
         # Probe once: real playback uses TtsWorker thread + runAndWait()
         try:
@@ -465,15 +486,23 @@ class MainWindow(QMainWindow):
 
         # Tabs – settings as a tab at the end
         tabs = QTabWidget()
+        self._tabs = tabs
         tabs.addTab(self._chat_tab(), "Symptom entry / 症状记录")
         tabs.addTab(self._recommendations_tab(), "Recommendations / 建议")
         tabs.addTab(self._doctor_pack_tab(), "Doctor pack / 就诊摘要")
         tabs.addTab(self._visit_tab(), "Visit capture / 门诊录音")
         tabs.addTab(self._meals_tab(), "Meals / 饮食记录")
+        tabs.addTab(self._companion_tab(), "Companion check-ins / 陪伴问候")
         tabs.addTab(self._settings_tab(), "Settings / 设置")
         self._load_settings()
+        self._load_companion_settings()
+        self._load_companion_pool()
         self.setCentralWidget(tabs)
         self._apply_style()
+        self._companion_timer = QTimer(self)
+        self._companion_timer.setInterval(30_000)
+        self._companion_timer.timeout.connect(self._companion_timer_tick)
+        self._companion_timer.start()
 
     def _client_or_prompt(self) -> Optional[BackendClient]:
         """Get client from settings; show message and return None if not configured."""
@@ -505,6 +534,270 @@ class MainWindow(QMainWindow):
         layout.addWidget(g)
         layout.addStretch()
         return w
+
+    def _companion_tab(self) -> QWidget:
+        w = QWidget()
+        outer = QVBoxLayout(w)
+        outer.setContentsMargins(24, 24, 24, 24)
+        outer.setSpacing(12)
+        title = QLabel("Companion check-ins / 陪伴问候")
+        title.setObjectName("SectionTitle")
+        outer.addWidget(title)
+
+        self._companion_master_cb = QCheckBox(
+            "Enable daily companion check-ins / 开启每日陪伴问候（自动在 symptoms 聊天里发起简短聊天）"
+        )
+        self._companion_master_cb.setChecked(False)
+        self._companion_master_cb.toggled.connect(self._on_companion_master_toggled)
+        outer.addWidget(self._companion_master_cb)
+
+        hint = QLabel(
+            "When enabled, the app may open the Symptom chat tab and send a warm bilingual hello "
+            "up to the number of times you choose. Each chat is limited to five exchanges, then gently ends.\n"
+            "开启后，应用会在“症状记录”里自动发起简短陪伴聊天（最多五轮来回），到点温和结束。"
+        )
+        hint.setWordWrap(True)
+        outer.addWidget(hint)
+
+        outer.addWidget(
+            QLabel(
+                "After changing options below, click Save settings so they are stored.\n"
+                "修改下方选项后，请点击「保存设置」写入本机。"
+            )
+        )
+
+        pool_note = QLabel(
+            "Opening lines use the built-in bilingual question list (Singapore / seniors). / "
+            "问候语使用内置题库（本地 companion_questions.json）。"
+        )
+        pool_note.setWordWrap(True)
+        outer.addWidget(pool_note)
+
+        sched_g = QGroupBox("Schedule / 时间安排")
+        sched_l = QVBoxLayout(sched_g)
+        row_count = QHBoxLayout()
+        row_count.addWidget(QLabel("Check-ins per day (max 3) / 每天次数："))
+        self._companion_num = QComboBox()
+        self._companion_num.addItems(["1", "2", "3"])
+        self._companion_num.setCurrentIndex(0)
+        row_count.addWidget(self._companion_num)
+        row_count.addStretch()
+        sched_l.addLayout(row_count)
+
+        win_row = QHBoxLayout()
+        win_row.addWidget(QLabel("Random time window / 随机时段："))
+        self._companion_win_start = QTimeEdit()
+        self._companion_win_start.setDisplayFormat("HH:mm")
+        self._companion_win_start.setTime(QTime(9, 0))
+        win_row.addWidget(self._companion_win_start)
+        win_row.addWidget(QLabel("–"))
+        self._companion_win_end = QTimeEdit()
+        self._companion_win_end.setDisplayFormat("HH:mm")
+        self._companion_win_end.setTime(QTime(21, 0))
+        win_row.addWidget(self._companion_win_end)
+        win_row.addStretch()
+        sched_l.addLayout(win_row)
+
+        self._companion_random_chk: List[QCheckBox] = []
+        self._companion_time_edits: List[QTimeEdit] = []
+        for i in range(3):
+            g2 = QGroupBox(f"Check-in {i + 1} / 第 {i + 1} 次")
+            f2 = QFormLayout(g2)
+            rb = QCheckBox("Use random time in window above / 在上面时段内随机")
+            rb.setChecked(True)
+            self._companion_random_chk.append(rb)
+            te = QTimeEdit()
+            te.setDisplayFormat("HH:mm")
+            te.setTime(QTime(10 + i * 4, 0))
+            self._companion_time_edits.append(te)
+            f2.addRow(rb)
+            f2.addRow("Fixed time / 固定时间：", te)
+            sched_l.addWidget(g2)
+
+        outer.addWidget(sched_g)
+        save_row = QHBoxLayout()
+        self._companion_save_btn = QPushButton("Save settings / 保存设置")
+        self._companion_save_btn.clicked.connect(self._on_companion_save_clicked)
+        save_row.addWidget(self._companion_save_btn)
+        save_row.addStretch()
+        outer.addLayout(save_row)
+        outer.addStretch()
+
+        for cw in (
+            self._companion_num,
+            self._companion_win_start,
+            self._companion_win_end,
+            *self._companion_random_chk,
+            *self._companion_time_edits,
+        ):
+            self._companion_cfg_widgets.append(cw)
+
+        self._update_companion_controls_enabled()
+        return w
+
+    def _on_companion_master_toggled(self, _checked: bool) -> None:
+        self._update_companion_controls_enabled()
+
+    def _on_companion_save_clicked(self) -> None:
+        self._persist_companion_settings(show_confirmation=True)
+
+    def _update_companion_controls_enabled(self) -> None:
+        on = self._companion_master_cb.isChecked()
+        for cw in self._companion_cfg_widgets:
+            cw.setEnabled(on)
+        for i in range(3):
+            if on:
+                fixed_enable = not self._companion_random_chk[i].isChecked()
+                self._companion_time_edits[i].setEnabled(fixed_enable)
+            else:
+                self._companion_time_edits[i].setEnabled(False)
+
+    def _persist_companion_settings(self, *, show_confirmation: bool = False) -> None:
+        s = QSettings("HealthDairy", "HealthDairy")
+        s.setValue("companion_enabled", self._companion_master_cb.isChecked())
+        s.setValue("companion_num", self._companion_num.currentIndex() + 1)
+        s.setValue("companion_win_start", self._companion_win_start.time().toString("HH:mm"))
+        s.setValue("companion_win_end", self._companion_win_end.time().toString("HH:mm"))
+        for i in range(3):
+            s.setValue(f"companion_slot{i}_random", self._companion_random_chk[i].isChecked())
+            s.setValue(f"companion_slot{i}_time", self._companion_time_edits[i].time().toString("HH:mm"))
+        s.sync()
+        self._companion_schedule = []
+        self._update_companion_controls_enabled()
+        if show_confirmation:
+            QMessageBox.information(
+                self,
+                "Companion check-ins / 陪伴问候",
+                "Settings saved successfully. / 设置已成功保存。",
+            )
+
+    def _load_companion_settings(self) -> None:
+        s = QSettings("HealthDairy", "HealthDairy")
+        self._companion_master_cb.blockSignals(True)
+        try:
+            self._companion_master_cb.setChecked(bool(s.value("companion_enabled", False)))
+            n = int(s.value("companion_num", 1))
+            self._companion_num.setCurrentIndex(max(0, min(2, n - 1)))
+            ws = s.value("companion_win_start", "09:00")
+            we = s.value("companion_win_end", "21:00")
+            if isinstance(ws, str) and QTime.fromString(ws, "HH:mm").isValid():
+                self._companion_win_start.setTime(QTime.fromString(ws, "HH:mm"))
+            if isinstance(we, str) and QTime.fromString(we, "HH:mm").isValid():
+                self._companion_win_end.setTime(QTime.fromString(we, "HH:mm"))
+            defaults = ("10:00", "14:00", "18:00")
+            for i in range(3):
+                r = s.value(f"companion_slot{i}_random", True)
+                self._companion_random_chk[i].setChecked(bool(r))
+                tt = s.value(f"companion_slot{i}_time", defaults[i])
+                if isinstance(tt, str):
+                    q = QTime.fromString(tt, "HH:mm")
+                    if q.isValid():
+                        self._companion_time_edits[i].setTime(q)
+        finally:
+            self._companion_master_cb.blockSignals(False)
+        self._update_companion_controls_enabled()
+
+    def _load_companion_pool(self) -> None:
+        self._companion_pool = load_question_pool()
+
+    def _window_minutes_pair(self) -> Tuple[int, int]:
+        ws = self._companion_win_start.time()
+        we = self._companion_win_end.time()
+        wsm = ws.hour() * 60 + ws.minute()
+        wem = we.hour() * 60 + we.minute()
+        if wem <= wsm:
+            wem += 24 * 60
+        return wsm, wem
+
+    def _companion_ensure_schedule(self) -> None:
+        import random
+
+        today = date.today()
+        if self._companion_plan_date != today:
+            self._companion_plan_date = today
+            self._companion_fired_slots.clear()
+            self._companion_schedule = []
+
+        if self._companion_schedule:
+            return
+
+        n = self._companion_num.currentIndex() + 1
+        wsm, wem = self._window_minutes_pair()
+        picks: List[Tuple[int, int]] = []
+        for i in range(n):
+            if self._companion_random_chk[i].isChecked():
+                span = max(0, wem - wsm)
+                if span <= 0:
+                    m = wsm
+                else:
+                    m = wsm + random.randint(0, span - 1) if span > 1 else wsm
+                m = m % (24 * 60)
+            else:
+                t = self._companion_time_edits[i].time()
+                m = t.hour() * 60 + t.minute()
+            picks.append((i, m))
+        picks.sort(key=lambda x: x[1])
+        adjusted: List[Tuple[int, int]] = []
+        last = -10_000
+        for slot_i, m in picks:
+            mm = m
+            if mm - last < 25:
+                mm = (last + 25) % (24 * 60)
+            adjusted.append((slot_i, mm))
+            last = mm
+        self._companion_schedule = adjusted
+
+    def _companion_timer_tick(self) -> None:
+        if not self._companion_master_cb.isChecked():
+            return
+        self._companion_ensure_schedule()
+        now = datetime.now().time()
+        now_m = now.hour * 60 + now.minute
+        for slot_i, target_m in self._companion_schedule:
+            if slot_i in self._companion_fired_slots:
+                continue
+            if now_m < target_m:
+                continue
+            self._companion_try_deliver(slot_i)
+            break
+
+    def _companion_try_deliver(self, slot_i: int) -> None:
+        if self._app_busy or self._chat_recording:
+            c = self._companion_defer_counts.get(slot_i, 0) + 1
+            self._companion_defer_counts[slot_i] = c
+            if c > 20:
+                self._companion_fired_slots.add(slot_i)
+                self._companion_defer_counts.pop(slot_i, None)
+            return
+        self._companion_defer_counts.pop(slot_i, None)
+        self._companion_fired_slots.add(slot_i)
+        self._deliver_companion_checkin(slot_i)
+
+    def _infer_lines_tts_lang(self, text: str) -> str:
+        t = (text or "").strip()
+        if not t:
+            return "en"
+        first_line = t.split("\n", 1)[0]
+        for ch in first_line:
+            if "\u4e00" <= ch <= "\u9fff":
+                return "zh"
+        return "en"
+
+    def _deliver_companion_checkin(self, slot_i: int) -> None:
+        if not self._companion_pool:
+            self._load_companion_pool()
+        qtext = pick_question(self._companion_pool, avoid_last=self._companion_last_question or None)
+        self._companion_last_question = qtext
+        self._chat_pathway = "companion"
+        self._messages = []
+        self._fields = {}
+        self._messages.append({"role": "assistant", "text": qtext})
+        self._append_chat(f"Companion (check-in {slot_i + 1}) / 陪伴问候：\n{qtext}")
+        if self._tts_enabled and self._tts_supported:
+            line0 = qtext.split("\n", 1)[0].strip() or qtext
+            self._speak(line0, self._infer_lines_tts_lang(qtext), source="chat")
+        if hasattr(self, "_tabs"):
+            self._tabs.setCurrentIndex(0)
 
     def _load_settings(self) -> None:
         s = QSettings("HealthDairy", "HealthDairy")
@@ -722,9 +1015,31 @@ class MainWindow(QMainWindow):
         title = QLabel("Visit capture / 门诊录音")
         title.setObjectName("SectionTitle")
         layout.addWidget(title)
-        self._visit_record_btn = QPushButton("Record (5 s) / 录音 5 秒")
-        self._visit_record_btn.clicked.connect(self._on_visit_record)
-        layout.addWidget(self._visit_record_btn)
+        layout.addWidget(
+            QLabel(
+                "Record until you press Stop (long consultations), or upload an audio file. "
+                "Then transcribe and get a summary.\n"
+                "录音时请按“停止”结束（适合较长医患对话）；也可上传音频后转写并生成摘要。"
+            )
+        )
+        row = QWidget()
+        rh = QHBoxLayout(row)
+        rh.setContentsMargins(0, 0, 0, 0)
+        self._visit_record_start_btn = QPushButton(
+            f"Start recording (max {int(VISIT_RECORD_MAX_SEC // 60)} min) / 开始录音"
+        )
+        self._visit_record_start_btn.clicked.connect(self._on_visit_record_start)
+        self._visit_record_stop_btn = QPushButton("Stop recording / 停止录音")
+        self._visit_record_stop_btn.setEnabled(False)
+        self._visit_record_stop_btn.clicked.connect(self._on_visit_record_stop)
+        rh.addWidget(self._visit_record_start_btn)
+        rh.addWidget(self._visit_record_stop_btn)
+        layout.addWidget(row)
+        self._visit_upload_btn = QPushButton(
+            "Upload audio file… / 上传音频文件…"
+        )
+        self._visit_upload_btn.clicked.connect(self._on_visit_upload_audio)
+        layout.addWidget(self._visit_upload_btn)
         layout.addWidget(QLabel("Transcript / 文字转写："))
         self._visit_transcript = QPlainTextEdit()
         self._visit_transcript.setReadOnly(True)
@@ -796,10 +1111,17 @@ class MainWindow(QMainWindow):
         messages = list(self._messages)
         fields = dict(self._fields)
         ts = self._ts_iso()
+        pathway = self._chat_pathway
 
         def fn():
             c = BackendClient(url)
-            return c.chat_step(user_id=user_id, messages=messages, fields=fields, ts=ts)
+            return c.chat_step(
+                user_id=user_id,
+                messages=messages,
+                fields=fields,
+                ts=ts,
+                pathway=pathway,
+            )
 
         def on_ok(result):
             self._on_chat_result(result)
@@ -812,14 +1134,16 @@ class MainWindow(QMainWindow):
         self._run_in_background(fn, on_ok, on_err)
 
     def _on_chat_result(self, result: Dict[str, Any]):
-        self._fields = result.get("fields") or {}
+        is_companion = self._chat_pathway == "companion"
+        if not is_companion:
+            self._fields = result.get("fields") or {}
         reply_lang = result.get("reply_lang") or "en"
         for c in result.get("clarifiers") or []:
             q = c.get("question", "")
             self._messages.append({"role": "assistant", "text": q})
             self._append_chat(f"Assistant: {q}")
             self._speak(q, reply_lang, source="chat")
-        if result.get("saved_id"):
+        if not is_companion and result.get("saved_id"):
             saved_line = (
                 result.get("saved_message")
                 or "Thanks. I've saved this entry for you."
@@ -827,13 +1151,20 @@ class MainWindow(QMainWindow):
             self._messages.append({"role": "assistant", "text": saved_line})
             self._append_chat(f"Assistant: {saved_line}")
             self._speak(saved_line, reply_lang, source="chat")
-        if result.get("ready") and not result.get("clarifiers"):
+        if not is_companion and result.get("ready") and not result.get("clarifiers"):
             self._messages = []
             self._fields = {}
+        if is_companion and result.get("companion_done"):
+            self._append_chat(
+                "--- Companion check-in ended / 本轮陪伴问候已结束（可随时继续记录症状）。 ---"
+            )
+            self._messages = []
+            self._fields = {}
+            self._chat_pathway = "abdominal_pain"
 
     def _on_chat_record_start(self):
         """Like web demo: record until Stop or max duration, then transcribe and send."""
-        if self._chat_recording or self._app_busy:
+        if self._chat_recording or self._app_busy or self._visit_recording:
             return
         client = self._client_or_prompt()
         if not client:
@@ -858,6 +1189,7 @@ class MainWindow(QMainWindow):
             self._set_busy(True)
             messages_snapshot = list(self._messages)
             fields_snapshot = dict(self._fields)
+            pathway_snapshot = self._chat_pathway
             ts = self._ts_iso()
 
             def fn_transcribe_and_chat() -> Dict[str, Any]:
@@ -873,6 +1205,7 @@ class MainWindow(QMainWindow):
                     messages=msgs,
                     fields=fields_snapshot,
                     ts=ts,
+                    pathway=pathway_snapshot,
                 )
                 return {"ok": True, "transcript": transcript, "result": result}
 
@@ -916,6 +1249,7 @@ class MainWindow(QMainWindow):
             return
         self._messages = []
         self._fields = {}
+        self._chat_pathway = "abdominal_pain"
         self._chat_log.clear()
         self._chat_input.clear()
 
@@ -1004,42 +1338,110 @@ class MainWindow(QMainWindow):
 
         self._pack_text.setPlainText("\n".join(lines))
 
-    def _on_visit_record(self):
-        self._set_busy(True)
+    @staticmethod
+    def _visit_audio_filename_and_mime(path: str) -> Tuple[str, str]:
+        ext = os.path.splitext(path)[1].lower()
+        mime = {
+            ".wav": "audio/wav",
+            ".webm": "audio/webm",
+            ".mp3": "audio/mpeg",
+            ".m4a": "audio/mp4",
+            ".ogg": "audio/ogg",
+        }.get(ext, "application/octet-stream")
+        name = os.path.basename(path) or "audio"
+        return name, mime
 
-        def fn():
-            return record_wav_seconds(5.0)
+    def _on_visit_record_start(self) -> None:
+        if self._visit_recording or self._app_busy or self._chat_recording:
+            return
+        self._visit_rec_stop_event.clear()
+        self._visit_recording = True
+        self._visit_upload_filename = "audio.wav"
+        self._visit_upload_content_type = "audio/wav"
+        self._set_busy(False)
 
-        def on_ok(wav: bytes):
+        def fn_record() -> bytes:
+            return record_wav_max_seconds_or_stop(VISIT_RECORD_MAX_SEC, self._visit_rec_stop_event)
+
+        def on_record_done(wav: bytes) -> None:
+            self._visit_recording = False
             self._set_busy(False)
+            if not wav or len(wav) < 500:
+                QMessageBox.information(self, "Visit", "Recording too short. Try again.\n录音太短。")
+                return
+            wav = _maybe_boost_wav_int16_mono(wav)
             self._visit_audio = wav
-            self._visit_transcript.setPlainText("(Recorded. Click 'Transcribe recording & get summary' to get transcript and summary.)")
+            self._visit_transcript.setPlainText(
+                "(Recording saved. Click “Transcribe & get summary”.)\n（录音已保存，可按“转写并生成摘要”。）"
+            )
 
-        def on_err(e: Exception):
-            QMessageBox.critical(self, "Error", str(e))
+        def on_record_err(e: Exception) -> None:
+            self._visit_recording = False
             self._set_busy(False)
+            QMessageBox.critical(self, "Visit", str(e))
 
-        self._run_in_background(fn, on_ok, on_err)
+        self._run_in_background(fn_record, on_record_done, on_record_err)
+
+    def _on_visit_record_stop(self) -> None:
+        self._visit_rec_stop_event.set()
+
+    def _on_visit_upload_audio(self) -> None:
+        if self._visit_recording or self._app_busy or self._chat_recording:
+            return
+        path, _filter = QFileDialog.getOpenFileName(
+            self,
+            "Open audio file / 选择音频",
+            "",
+            "Audio (*.wav *.WAV *.webm *.WEBM *.mp3 *.MP3 *.m4a *.M4A *.ogg *.OGG);;All files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            QMessageBox.critical(self, "Visit", f"Could not read file.\n{e}")
+            return
+        if not data or len(data) < 100:
+            QMessageBox.warning(self, "Visit", "File is empty or too small.\n文件为空或过小。")
+            return
+        name, mime = self._visit_audio_filename_and_mime(path)
+        self._visit_upload_filename = name
+        self._visit_upload_content_type = mime
+        self._visit_audio = data
+        self._visit_transcript.setPlainText(
+            f"(Loaded {name}. Click “Transcribe & get summary”.)\n（已加载 {name} ，可按“转写并生成摘要”。）"
+        )
 
     def _on_visit_summary(self):
         client = self._client_or_prompt()
         if not client:
             return
         if not getattr(self, "_visit_audio", None):
-            QMessageBox.warning(self, "Visit", "Record first (Record 5 s).")
+            QMessageBox.warning(self, "Visit", "Record or upload audio first.\n请先录音或上传音频。")
             return
         self._set_busy(True)
         wav = self._visit_audio
         url = self._backend_edit.text().strip()
         user_id = self._user_edit.text().strip() or "demo-user-1"
-        lang = "en"
+        lang: Optional[str] = None
+        fname = self._visit_upload_filename
+        ctype = self._visit_upload_content_type
+        tmo = max(120, min(3600, 60 + len(wav) // 3000))
 
         def fn():
             c = BackendClient(url)
-            trans = c.transcribe(user_id=user_id, audio_bytes=wav, lang=lang)
+            trans = c.transcribe(
+                user_id=user_id,
+                audio_bytes=wav,
+                lang=lang,
+                filename=fname,
+                content_type=ctype,
+                timeout=tmo,
+            )
             transcript = trans.get("transcript") or trans.get("text") or ""
             if transcript:
-                summary = c.visit_summary(user_id=user_id, transcript=transcript, lang=lang)
+                summary = c.visit_summary(user_id=user_id, transcript=transcript, lang="en")
                 return {"transcript": transcript, "summary": summary}
             return {"transcript": "", "summary": {}}
 
@@ -1238,14 +1640,22 @@ class MainWindow(QMainWindow):
     def _set_busy(self, busy: bool):
         self._app_busy = busy
         self._chat_send_btn.setEnabled(not busy and not self._chat_recording)
-        self._chat_record_start_btn.setEnabled(not busy and not self._chat_recording)
+        self._chat_record_start_btn.setEnabled(
+            not busy and not self._chat_recording and not self._visit_recording
+        )
         self._chat_record_stop_btn.setEnabled(self._chat_recording and not busy)
         if hasattr(self, "_chat_refresh_btn"):
             self._chat_refresh_btn.setEnabled(not busy and not self._chat_recording)
         self._recs_btn.setEnabled(not busy)
         self._pack_btn.setEnabled(not busy)
-        self._visit_record_btn.setEnabled(not busy)
-        self._visit_summary_btn.setEnabled(not busy)
+        if hasattr(self, "_visit_record_start_btn"):
+            self._visit_record_start_btn.setEnabled(not busy and not self._visit_recording)
+        if hasattr(self, "_visit_record_stop_btn"):
+            self._visit_record_stop_btn.setEnabled(self._visit_recording and not busy)
+        if hasattr(self, "_visit_upload_btn"):
+            self._visit_upload_btn.setEnabled(not busy and not self._visit_recording)
+        if hasattr(self, "_visit_summary_btn"):
+            self._visit_summary_btn.setEnabled(not busy)
         if hasattr(self, "_meal_save_btn"):
             self._meal_save_btn.setEnabled(not busy)
         if hasattr(self, "_meal_analyze_btn"):

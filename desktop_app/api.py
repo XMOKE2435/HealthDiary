@@ -26,9 +26,15 @@ class BackendClient:
         messages: List[Dict[str, str]],
         fields: Optional[Dict[str, Any]] = None,
         ts: Optional[str] = None,
+        pathway: str = "abdominal_pain",
     ) -> Dict[str, Any]:
         """POST /diary/chat/step. messages = [{"role":"user"|"assistant","text":"..."}]"""
-        body = {"user_id": user_id, "messages": messages, "fields": fields or {}, "pathway": "abdominal_pain"}
+        body = {
+            "user_id": user_id,
+            "messages": messages,
+            "fields": fields or {},
+            "pathway": pathway,
+        }
         if ts:
             body["ts"] = ts
         return self._post("/diary/chat/step", json=body)
@@ -37,16 +43,22 @@ class BackendClient:
         self,
         user_id: str,
         audio_bytes: bytes,
-        lang: str = "en",
+        lang: Optional[str] = "en",
+        filename: str = "audio.wav",
+        content_type: Optional[str] = None,
+        timeout: int = 120,
     ) -> Dict[str, Any]:
         """POST /visit/transcribe with multipart audio file."""
-        files = {"audio": ("audio.wav", audio_bytes, "audio/wav")}
-        data = {"user_id": user_id, "lang": lang}
+        ct = content_type or "audio/wav"
+        files = {"audio": (filename, audio_bytes, ct)}
+        data: Dict[str, Any] = {"user_id": user_id}
+        if lang is not None and lang != "":
+            data["lang"] = lang
         r = requests.post(
             f"{self.base_url}/visit/transcribe",
             files=files,
             data=data,
-            timeout=60,
+            timeout=timeout,
         )
         r.raise_for_status()
         return r.json()

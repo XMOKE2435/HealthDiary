@@ -460,7 +460,13 @@ class QwenClient:
                 print(traceback.format_exc())
                 raise RuntimeError(f"ASR API request failed: {exc}") from exc
 
-    async def _post_chat(self, messages: List[Dict[str, str]], response_format: str | None = None, model: str | None = None) -> str:
+    async def _post_chat(
+        self,
+        messages: List[Dict[str, str]],
+        response_format: str | None = None,
+        model: str | None = None,
+        temperature: float = 0.2,
+    ) -> str:
         """Send chat-style messages and return assistant content string.
         Supports OpenAI-compatible schema used by DashScope compatible-mode.
         """
@@ -472,7 +478,7 @@ class QwenClient:
             payload: Dict[str, Any] = {
                 "model": model_name,
                 "messages": messages,
-                "temperature": 0.2,
+                "temperature": temperature,
             }
             if response_format:
                 # some providers accept {"type":"json_object"}
@@ -773,6 +779,67 @@ class QwenClient:
         }
         content = await self._post_chat([sys, hint] + conv_msgs)
         return content or "Could you tell me a bit more?"
+
+    async def companion_reply(
+        self,
+        messages: List[Dict[str, str]],
+        reply_lang: str,
+        user_turn_count: int,
+        max_rounds: int = 5,
+    ) -> str:
+        """Short, warm companion replies for seniors (e.g. Singapore). Not medical advice.
+
+        When ``user_turn_count >= max_rounds``, the model must close the chat kindly in 1–2 short sentences.
+        """
+        lc = (reply_lang or "en").strip().lower()
+        if lc.startswith("zh"):
+            closing_hint = (
+                "这是本轮的最后一轮回复。请用一两句温馨的简体中文道别，表达关心和祝福，"
+                "不要说教，不要提问，不要给医疗建议。"
+            )
+            sys_text = (
+                "你是陪伴长辈的贴心小助手，语气像家人或邻里一样温暖、耐心。\n"
+                "读者可能在新加坡生活；可以自然提到天气、吃饭、散步、家人、邻里、熟语（但不要刻板）。\n"
+                "每次回复最多两三句，口语化，好读好懂。不要诊断、不开药、不代替医生。\n"
+                "如果用户没说什么，也要温和回应，不要太长。\n"
+                "必须全程使用简体中文。"
+            )
+            mock_heart = [
+                "我在这里陪着您呢，您慢慢说就好。",
+                "听到您这么说，我心里也暖暖的。今天有没有按时吃点东西？",
+                "谢谢您和我聊天，您多保重，想见您的时候我再来看您。",
+            ]
+        else:
+            closing_hint = (
+                "This is the final turn of this short check-in. Reply in 1–2 short, warm sentences only: "
+                "say goodbye with care; do not ask a question; no medical advice; no lecturing."
+            )
+            sys_text = (
+                "You are a gentle daily companion for older adults, like a caring neighbour or family friend.\n"
+                "Many users live in Singapore; you may naturally mention hawker food, Housing Board life, "
+                "the heat, walking to the coffeeshop, family—never stereotype.\n"
+                "Keep each reply to 2–3 short sentences, plain English, easy to read aloud.\n"
+                "No medical diagnosis or medication advice.\n"
+                "Reply in English only."
+            )
+            mock_heart = [
+                "I'm right here with you—no rush at all.",
+                "Thank you for sharing that; it means a lot. I hope your day's been kind to you.",
+                "It's been a lovely chat. Take care of yourself—I look forward to our next visit.",
+            ]
+
+        if not self.endpoint:
+            idx = min(max(user_turn_count - 1, 0), len(mock_heart) - 1)
+            return mock_heart[idx] if user_turn_count < max_rounds else mock_heart[-1]
+
+        conv = [{"role": m.get("role", "user"), "content": m.get("text", "")} for m in messages[-14:]]
+        sys_msg = {"role": "system", "content": sys_text}
+        extra: List[Dict[str, str]] = []
+        if user_turn_count >= max_rounds:
+            extra.append({"role": "system", "content": closing_hint})
+
+        out = await self._post_chat([sys_msg] + extra + conv, temperature=0.55)
+        return (out or mock_heart[-1]).strip()
 
     async def recommend_from_entries(self, entries: List[Dict[str, Any]], window_days: int) -> List[Dict[str, Any]]:
         """Analyze past entries and return non-medical recommendations with evidence pointers.
