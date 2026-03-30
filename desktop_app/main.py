@@ -152,11 +152,11 @@ class TtsWorker:
 
         try:
             if self._backend == "espeak":
-                cmd: List[str] = [self._linux_tts_bin, "--stdout", "-s", "150"]
+                cmd: List[str] = [self._linux_tts_bin, "--stdout", "-s", "170"]
                 if lc.startswith("zh"):
                     cmd.extend(["-v", "zh"])
                 else:
-                    cmd.extend(["-v", "en"])
+                    cmd.extend(["-v", "en-us"])
                 cmd.append(text)
 
                 espeak_proc = subprocess.Popen(
