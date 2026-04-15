@@ -40,15 +40,41 @@ Native desktop application built with **Python + PySide6 (Qt)**. Uses the Pi’s
 
 ### Raspberry Pi / Linux: voice playback (TTS)
 
-The app tries **pyttsx3** first; on many Pis that fails even when the speaker works with `aplay`. In that case it uses **eSpeak-NG** (same ALSA path as normal playback).
+The app picks Linux TTS backends in this order:
+1. **Piper** (offline neural voice, least robotic)
+2. **edge-tts** (neural cloud voice)
+3. **eSpeak-NG** / `spd-say` fallback
+4. `pyttsx3`
 
-Install on Debian / Raspberry Pi OS (either is enough; both is fine):
+Baseline fallback packages:
 
 ```bash
 sudo apt update && sudo apt install -y espeak-ng speech-dispatcher
 ```
 
-Test: `espeak-ng "hello"` should play on your speaker. If the app still says voice is unsupported, launch it from a terminal once — some desktop shortcuts use a minimal `PATH` and miss `/usr/bin`; the app now prepends `/usr/bin` and checks those paths directly.
+Recommended for natural voice (Piper):
+
+```bash
+# Install piper binary (package name may vary by distro image)
+sudo apt install -y piper
+```
+
+Then set model paths in environment (for example in `~/.bashrc` on Pi):
+
+```bash
+export HEALTHDAIRY_TTS_PIPER_MODEL_EN=/home/pi/models/piper/en_US-lessac-medium.onnx
+export HEALTHDAIRY_TTS_PIPER_MODEL_ZH=/home/pi/models/piper/zh_CN-huayan-medium.onnx
+```
+
+Optional: force backend selection:
+
+```bash
+export HEALTHDAIRY_TTS_BACKEND=piper
+```
+
+Test fallback quickly: `espeak-ng "hello"` should play on your speaker.
+If the app still says voice is unsupported, launch it from a terminal once — some desktop
+shortcuts use a minimal `PATH` and miss `/usr/bin`; the app prepends `/usr/bin` and checks those paths directly.
 
 ---
 

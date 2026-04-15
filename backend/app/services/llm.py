@@ -188,6 +188,9 @@ class QwenClient:
         self.asr_model = os.getenv("QWEN_ASR_MODEL", "paraformer-v2").strip()
         # Dedicated speech endpoint is required for audio (DashScope native API)
         self.speech_endpoint = os.getenv("QWEN_SPEECH_ENDPOINT", "").strip()
+        # Local models on Raspberry Pi can be slow for long prompts.
+        # Use a configurable chat timeout to avoid frequent read timeouts.
+        self.chat_timeout_sec = float(os.getenv("LLM_CHAT_TIMEOUT_SEC", "60").strip() or "60")
 
     async def _post_json(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         if not self.endpoint:
@@ -515,7 +518,7 @@ class QwenClient:
             if response_format:
                 # some providers accept {"type":"json_object"}
                 payload["response_format"] = {"type": response_format}
-            async with httpx.AsyncClient(timeout=15) as client:
+            async with httpx.AsyncClient(timeout=self.chat_timeout_sec) as client:
                 r = await client.post(self.endpoint, headers=headers, json=payload)
                 r.raise_for_status()
                 data = r.json()
@@ -938,7 +941,11 @@ class QwenClient:
                 "Return a JSON array of 3-5 detailed, professional recommendations. Each recommendation should be 2-3 sentences explaining what to monitor/track, why (based on patterns observed), and how to do it."
             ),
         }
-        content = await self._post_chat([sys, user], response_format="json_object")
+        try:
+            content = await self._post_chat([sys, user], response_format="json_object")
+        except Exception as exc:
+            _log.warning("recommend_from_entries LLM call failed; using fallback: %s", exc)
+            return [{"text": "Continue monitoring symptoms.", "evidence": [f"entry_id:{entries[-1].get('id')}"]}]
         try:
             obj = json.loads(content)
             if isinstance(obj, list):

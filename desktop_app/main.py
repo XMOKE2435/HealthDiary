@@ -45,11 +45,12 @@ class TtsWorker:
     """TTS on a background thread.
 
     - **Windows:** ``pyttsx3`` (SAPI) with COM init + fresh engine per phrase.
-    - **Linux / Pi:** Prefer **edge-tts** (Microsoft neural voices; needs network + ``mpg123`` or
-      ``ffmpeg`` for playback), then **eSpeak-NG** piped to **aplay** (see
-      ``_linux_playback_device``), then ``spd-say``, then ``pyttsx3``. Set
-      ``HEALTHDAIRY_TTS_BACKEND=espeak`` to skip edge-tts. GUI launches often have a minimal
-      ``PATH``; we also check ``/usr/bin/...`` directly.
+    - **Linux / Pi:** Prefer **Piper** (offline neural TTS) when model path is configured,
+      then **edge-tts** (Microsoft neural voices; needs network + ``mpg123`` or ``ffmpeg`` for
+      playback), then **eSpeak-NG** piped to **aplay** (see ``_linux_playback_device``), then
+      ``spd-say``, then ``pyttsx3``.
+      Set ``HEALTHDAIRY_TTS_BACKEND`` to one of ``piper|edge_tts|espeak|spd_say|pyttsx3`` to force
+      a backend. GUI launches often have a minimal ``PATH``; we also check ``/usr/bin/...`` directly.
     """
 
     _STOP = "__tts_stop__"
@@ -60,9 +61,13 @@ class TtsWorker:
         self._thread: Optional[threading.Thread] = None
         self._started = threading.Event()
         self._init_ok = False
-        self._backend = "none"  # "pyttsx3" | "edge_tts" | "espeak" | "spd_say"
+        self._backend = "none"  # "pyttsx3" | "piper" | "edge_tts" | "espeak" | "spd_say"
         self._linux_tts_bin: Optional[str] = None
         self._linux_espeak_fallback: Optional[Tuple[str, str]] = None
+        self._piper_model_en = os.environ.get("HEALTHDAIRY_TTS_PIPER_MODEL_EN", "").strip()
+        self._piper_model_zh = os.environ.get("HEALTHDAIRY_TTS_PIPER_MODEL_ZH", "").strip()
+        self._piper_config_en = os.environ.get("HEALTHDAIRY_TTS_PIPER_CONFIG_EN", "").strip()
+        self._piper_config_zh = os.environ.get("HEALTHDAIRY_TTS_PIPER_CONFIG_ZH", "").strip()
         # ALSA plug device for Pi I2S (e.g. MAX98357A); adjust if aplay -l shows a different card.
         self._linux_playback_device = "plughw:2,0"
         self._active_lock = threading.Lock()
@@ -122,6 +127,33 @@ class TtsWorker:
                     return (kind, p)
         return ("none", "")
 
+    def _resolve_piper_model(self, lang: str) -> Tuple[str, str]:
+        lc = (lang or "en").lower().strip()
+        if lc.startswith("zh"):
+            return (self._piper_model_zh, self._piper_config_zh)
+        return (self._piper_model_en, self._piper_config_en)
+
+    def _probe_piper_linux(self) -> bool:
+        forced = os.environ.get("HEALTHDAIRY_TTS_BACKEND", "").strip().lower()
+        if forced and forced != "piper":
+            return False
+        self._ensure_unix_path()
+        piper_bin = shutil.which("piper") or "/usr/local/bin/piper" or "/usr/bin/piper"
+        if not self._is_executable(piper_bin):
+            return False
+        model_en, _ = self._resolve_piper_model("en")
+        model_zh, _ = self._resolve_piper_model("zh")
+        if not (model_en or model_zh):
+            # No model configured yet; do not fail startup, just skip Piper.
+            print(
+                "[TTS] Piper found but no model path set. "
+                "Set HEALTHDAIRY_TTS_PIPER_MODEL_EN and/or HEALTHDAIRY_TTS_PIPER_MODEL_ZH.",
+                flush=True,
+            )
+            return False
+        self._linux_tts_bin = piper_bin
+        return True
+
     @staticmethod
     def _linux_mp3_player_cmd() -> Optional[List[str]]:
         """Return a command prefix that can play ``file.mp3`` (last arg), or None."""
@@ -133,7 +165,8 @@ class TtsWorker:
         return None
 
     def _probe_edge_tts_linux(self) -> bool:
-        if os.environ.get("HEALTHDAIRY_TTS_BACKEND", "").strip().lower() == "espeak":
+        forced = os.environ.get("HEALTHDAIRY_TTS_BACKEND", "").strip().lower()
+        if forced and forced != "edge_tts":
             return False
         try:
             import edge_tts  # noqa: F401
@@ -202,6 +235,27 @@ class TtsWorker:
                 except Exception:
                     pass
 
+    def _play_wav_linux(self, path: str) -> None:
+        proc: Optional[subprocess.Popen] = None
+        try:
+            proc = subprocess.Popen(
+                ["aplay", "-q", "-D", self._linux_playback_device, path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            with self._active_lock:
+                self._active_proc = proc
+            proc.wait()
+        finally:
+            with self._active_lock:
+                if self._active_proc is proc:
+                    self._active_proc = None
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+
     def _speak_edge_tts(self, text: str, lang: str) -> None:
         import asyncio
 
@@ -245,6 +299,45 @@ class TtsWorker:
             finally:
                 self._backend = prev_b
                 self._linux_tts_bin = prev_bin
+
+    def _speak_piper(self, text: str, lang: str) -> None:
+        if not self._linux_tts_bin:
+            raise RuntimeError("piper binary is not configured")
+        model_path, config_path = self._resolve_piper_model(lang)
+        if not model_path:
+            # Fallback by language if only one model is configured.
+            model_path = self._piper_model_en or self._piper_model_zh
+            config_path = self._piper_config_en or self._piper_config_zh
+        if not model_path:
+            raise RuntimeError("piper model path not configured")
+        if not os.path.isfile(model_path):
+            raise RuntimeError(f"piper model file not found: {model_path}")
+        if not config_path:
+            auto_cfg = model_path + ".json"
+            if os.path.isfile(auto_cfg):
+                config_path = auto_cfg
+
+        fd, wav_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        try:
+            cmd: List[str] = [self._linux_tts_bin, "--model", model_path, "--output_file", wav_path]
+            if config_path and os.path.isfile(config_path):
+                cmd.extend(["--config", config_path])
+            # Piper reads input text from stdin.
+            subprocess.run(
+                cmd,
+                input=text.encode("utf-8", errors="replace"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                check=True,
+                timeout=90,
+            )
+            self._play_wav_linux(wav_path)
+        finally:
+            try:
+                os.remove(wav_path)
+            except OSError:
+                pass
 
     def _interrupt_playback(self) -> None:
         with self._active_lock:
@@ -355,7 +448,30 @@ class TtsWorker:
             if sys.platform != "win32":
                 kind, path = self._pick_linux_cli_tts()
                 self._linux_espeak_fallback = (kind, path) if kind != "none" and path else None
-                if self._probe_edge_tts_linux():
+                forced = os.environ.get("HEALTHDAIRY_TTS_BACKEND", "").strip().lower()
+                if forced == "piper" and self._probe_piper_linux():
+                    self._backend = "piper"
+                    self._init_ok = True
+                elif forced == "edge_tts" and self._probe_edge_tts_linux():
+                    self._backend = "edge_tts"
+                    self._linux_tts_bin = None
+                    self._init_ok = True
+                elif forced in ("espeak", "spd_say") and kind == forced and path:
+                    self._backend = kind
+                    self._linux_tts_bin = path
+                    self._init_ok = True
+                elif forced == "pyttsx3":
+                    try:
+                        probe = pyttsx3.init()
+                        del probe
+                        self._backend = "pyttsx3"
+                        self._init_ok = True
+                    except Exception:
+                        self._init_ok = False
+                elif self._probe_piper_linux():
+                    self._backend = "piper"
+                    self._init_ok = True
+                elif self._probe_edge_tts_linux():
                     self._backend = "edge_tts"
                     self._linux_tts_bin = None
                     self._init_ok = True
@@ -406,6 +522,26 @@ class TtsWorker:
                     lang = str(item[2]) if len(item) > 2 else "en"
                 else:
                     text = str(item)
+
+                if self._backend == "piper":
+                    try:
+                        self._speak_piper(text, lang)
+                    except Exception as e:
+                        print(f"[TTS] Piper failed, falling back to edge/espeak: {e}", flush=True)
+                        if self._probe_edge_tts_linux():
+                            self._speak_edge_with_espeak_fallback(text, lang)
+                        elif self._linux_espeak_fallback:
+                            fb_kind, fb_path = self._linux_espeak_fallback
+                            prev_b = self._backend
+                            prev_bin = self._linux_tts_bin
+                            try:
+                                self._backend = fb_kind
+                                self._linux_tts_bin = fb_path
+                                self._speak_linux_cli(text, lang)
+                            finally:
+                                self._backend = prev_b
+                                self._linux_tts_bin = prev_bin
+                    continue
 
                 if self._backend == "edge_tts":
                     self._speak_edge_with_espeak_fallback(text, lang)
