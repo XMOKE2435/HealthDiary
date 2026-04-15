@@ -6,6 +6,7 @@ import queue
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import wave
@@ -44,9 +45,11 @@ class TtsWorker:
     """TTS on a background thread.
 
     - **Windows:** ``pyttsx3`` (SAPI) with COM init + fresh engine per phrase.
-    - **Linux / Pi:** Prefer **eSpeak-NG** piped to **aplay** on a fixed ALSA device (see
-      ``_linux_playback_device``), then ``spd-say``, then ``pyttsx3``. GUI launches often have a
-      minimal ``PATH``; we also check ``/usr/bin/...`` directly.
+    - **Linux / Pi:** Prefer **edge-tts** (Microsoft neural voices; needs network + ``mpg123`` or
+      ``ffmpeg`` for playback), then **eSpeak-NG** piped to **aplay** (see
+      ``_linux_playback_device``), then ``spd-say``, then ``pyttsx3``. Set
+      ``HEALTHDAIRY_TTS_BACKEND=espeak`` to skip edge-tts. GUI launches often have a minimal
+      ``PATH``; we also check ``/usr/bin/...`` directly.
     """
 
     _STOP = "__tts_stop__"
@@ -57,8 +60,9 @@ class TtsWorker:
         self._thread: Optional[threading.Thread] = None
         self._started = threading.Event()
         self._init_ok = False
-        self._backend = "none"  # "pyttsx3" | "espeak" | "spd_say"
+        self._backend = "none"  # "pyttsx3" | "edge_tts" | "espeak" | "spd_say"
         self._linux_tts_bin: Optional[str] = None
+        self._linux_espeak_fallback: Optional[Tuple[str, str]] = None
         # ALSA plug device for Pi I2S (e.g. MAX98357A); adjust if aplay -l shows a different card.
         self._linux_playback_device = "plughw:2,0"
         self._active_lock = threading.Lock()
@@ -117,6 +121,130 @@ class TtsWorker:
                 if self._is_executable(p):
                     return (kind, p)
         return ("none", "")
+
+    @staticmethod
+    def _linux_mp3_player_cmd() -> Optional[List[str]]:
+        """Return a command prefix that can play ``file.mp3`` (last arg), or None."""
+        mpg = shutil.which("mpg123")
+        if mpg:
+            return [mpg, "-q", "-o", "alsa"]
+        if shutil.which("ffmpeg") and shutil.which("aplay"):
+            return ["__ffmpeg_aplay__"]
+        return None
+
+    def _probe_edge_tts_linux(self) -> bool:
+        if os.environ.get("HEALTHDAIRY_TTS_BACKEND", "").strip().lower() == "espeak":
+            return False
+        try:
+            import edge_tts  # noqa: F401
+        except ImportError:
+            return False
+        if self._linux_mp3_player_cmd() is None:
+            print(
+                "[TTS] edge-tts needs mpg123 or (ffmpeg + aplay) for playback; "
+                "install: sudo apt install -y mpg123",
+                flush=True,
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _edge_voice_for_lang(lang: str) -> str:
+        lc = (lang or "en").lower().strip()
+        if lc.startswith("zh"):
+            return os.environ.get("HEALTHDAIRY_TTS_EDGE_VOICE_ZH", "").strip() or "zh-CN-XiaoxiaoNeural"
+        return os.environ.get("HEALTHDAIRY_TTS_EDGE_VOICE_EN", "").strip() or "en-US-AriaNeural"
+
+    def _play_mp3_linux(self, path: str) -> None:
+        dev = self._linux_playback_device
+        prefix = self._linux_mp3_player_cmd()
+        if not prefix:
+            raise RuntimeError("no mp3 player (mpg123 or ffmpeg+aplay)")
+        proc: Optional[subprocess.Popen] = None
+        wav_path: Optional[str] = None
+        try:
+            if prefix[0] == "__ffmpeg_aplay__":
+                ffmpeg = shutil.which("ffmpeg")
+                if not ffmpeg:
+                    raise RuntimeError("ffmpeg not found")
+                wav_path = path + ".wav.tmp"
+                subprocess.run(
+                    [ffmpeg, "-nostdin", "-loglevel", "error", "-y", "-i", path, "-f", "wav", wav_path],
+                    check=True,
+                    timeout=120,
+                )
+                proc = subprocess.Popen(
+                    ["aplay", "-q", "-D", dev, wav_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                proc = subprocess.Popen(
+                    prefix + ["-a", dev, path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            with self._active_lock:
+                self._active_proc = proc
+            proc.wait()
+        finally:
+            with self._active_lock:
+                if self._active_proc is proc:
+                    self._active_proc = None
+            if wav_path:
+                try:
+                    os.remove(wav_path)
+                except OSError:
+                    pass
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+
+    def _speak_edge_tts(self, text: str, lang: str) -> None:
+        import asyncio
+
+        import edge_tts
+
+        voice = self._edge_voice_for_lang(lang)
+
+        async def _synth(out_path: str) -> None:
+            communicate = edge_tts.Communicate(text, voice)
+            with open(out_path, "wb") as out_f:
+                async for chunk in communicate.stream():
+                    if chunk["type"] == "audio":
+                        out_f.write(chunk["data"])
+
+        fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
+        os.close(fd)
+        try:
+            asyncio.run(_synth(mp3_path))
+            self._play_mp3_linux(mp3_path)
+        finally:
+            try:
+                os.remove(mp3_path)
+            except OSError:
+                pass
+
+    def _speak_edge_with_espeak_fallback(self, text: str, lang: str) -> None:
+        try:
+            self._speak_edge_tts(text, lang)
+        except Exception as e:
+            print(f"[TTS] edge-tts failed, falling back to eSpeak: {e}", flush=True)
+            fb = self._linux_espeak_fallback
+            if not fb:
+                return
+            kind, path = fb
+            prev_b = self._backend
+            prev_bin = self._linux_tts_bin
+            try:
+                self._backend = kind
+                self._linux_tts_bin = path
+                self._speak_linux_cli(text, lang)
+            finally:
+                self._backend = prev_b
+                self._linux_tts_bin = prev_bin
 
     def _interrupt_playback(self) -> None:
         with self._active_lock:
@@ -226,7 +354,12 @@ class TtsWorker:
             self._backend = "none"
             if sys.platform != "win32":
                 kind, path = self._pick_linux_cli_tts()
-                if kind != "none" and path:
+                self._linux_espeak_fallback = (kind, path) if kind != "none" and path else None
+                if self._probe_edge_tts_linux():
+                    self._backend = "edge_tts"
+                    self._linux_tts_bin = None
+                    self._init_ok = True
+                elif kind != "none" and path:
                     self._backend = kind
                     self._linux_tts_bin = path
                     self._init_ok = True
@@ -273,6 +406,10 @@ class TtsWorker:
                     lang = str(item[2]) if len(item) > 2 else "en"
                 else:
                     text = str(item)
+
+                if self._backend == "edge_tts":
+                    self._speak_edge_with_espeak_fallback(text, lang)
+                    continue
 
                 if self._backend in ("espeak", "spd_say"):
                     self._speak_linux_cli(text, lang)

@@ -46,7 +46,7 @@ def _load_env_from_file(env_path: Path) -> bool:
 
 
 def _ensure_qwen_env_loaded() -> None:
-    """Load .env from project root and cwd so QWEN_* are set (e.g. on Pi)."""
+    """Load .env from project root and cwd so QWEN_* / LOCAL_LLM_* are set."""
     # Project root: backend/app/services/llm.py -> parent.parent.parent.parent
     _root = Path(__file__).resolve().parent.parent.parent.parent
     cwd = Path.cwd()
@@ -54,9 +54,12 @@ def _ensure_qwen_env_loaded() -> None:
     loaded_from = None
     # Load from file first (manual parse) so we overwrite any empty env vars
     for p in paths_to_try:
-        if _load_env_from_file(p):
+        _load_env_from_file(p)
+        local_ep = (os.getenv("LOCAL_LLM_ENDPOINT") or "").strip()
+        qwen_ep = (os.getenv("QWEN_ENDPOINT") or "").strip()
+        if local_ep or qwen_ep:
             loaded_from = str(p)
-            break  # Found QWEN_* vars, stop
+            break
     # Then try python-dotenv for any vars not in our manual parse
     try:
         from dotenv import load_dotenv
@@ -65,18 +68,33 @@ def _ensure_qwen_env_loaded() -> None:
     except ImportError:
         pass
     # Always print so you see it even if log level is high
-    ep = (os.getenv("QWEN_ENDPOINT") or "").strip()
-    key_set = bool((os.getenv("QWEN_API_KEY") or "").strip())
-    if ep and key_set:
-        print(f"[LLM] ✓ QWEN_* loaded (endpoint: {ep[:50]}..., key: {'set' if key_set else 'empty'})")
+    llm_ep = (os.getenv("LOCAL_LLM_ENDPOINT") or "").strip()
+    llm_key_set = bool((os.getenv("LOCAL_LLM_API_KEY") or "").strip())
+    qwen_ep = (os.getenv("QWEN_ENDPOINT") or "").strip()
+    qwen_key_set = bool((os.getenv("QWEN_API_KEY") or "").strip())
+    if llm_ep or qwen_ep:
+        print(
+            "[LLM] ✓ Endpoints loaded "
+            f"(LOCAL_LLM_ENDPOINT={'set' if llm_ep else 'empty'}, "
+            f"QWEN_ENDPOINT={'set' if qwen_ep else 'empty'})"
+        )
         if loaded_from:
             print(f"[LLM]   Loaded from: {loaded_from}")
+        print(
+            "[LLM]   Keys "
+            f"(LOCAL_LLM_API_KEY={'set' if llm_key_set else 'empty'}, "
+            f"QWEN_API_KEY={'set' if qwen_key_set else 'empty'})"
+        )
     else:
-        print(f"[LLM] ✗ QWEN_* NOT loaded. Checked paths:")
+        print(f"[LLM] ✗ No LLM endpoint env vars loaded. Checked paths:")
         for p in paths_to_try:
             exists = "✓" if p.exists() else "✗"
             print(f"[LLM]   {exists} {p}")
-        print(f"[LLM]   Current: QWEN_ENDPOINT={'set' if ep else 'EMPTY'}, QWEN_API_KEY={'set' if key_set else 'EMPTY'}")
+        print(
+            "[LLM]   Current: "
+            f"LOCAL_LLM_ENDPOINT={'set' if llm_ep else 'EMPTY'}, "
+            f"QWEN_ENDPOINT={'set' if qwen_ep else 'EMPTY'}"
+        )
 
 
 _ensure_qwen_env_loaded()
@@ -148,9 +166,23 @@ def build_summary_system_prompt(
 
 class QwenClient:
     def __init__(self) -> None:
-        self.endpoint = os.getenv("QWEN_ENDPOINT", "").strip()
-        self.api_key = os.getenv("QWEN_API_KEY", "").strip()
-        self.model = os.getenv("QWEN_MODEL", "qwen2.5-7b-instruct").strip()
+        # Text reasoning endpoint (preferred): local Pi-hosted OpenAI-compatible API.
+        # Falls back to QWEN_ENDPOINT for backwards compatibility.
+        self.endpoint = (
+            os.getenv("LOCAL_LLM_ENDPOINT", "").strip()
+            or os.getenv("QWEN_ENDPOINT", "").strip()
+        )
+        self.api_key = (
+            os.getenv("LOCAL_LLM_API_KEY", "").strip()
+            or os.getenv("QWEN_API_KEY", "").strip()
+        )
+        self.model = (
+            os.getenv("LOCAL_LLM_MODEL", "").strip()
+            or os.getenv("QWEN_MODEL", "qwen2.5-7b-instruct").strip()
+        )
+        # Dedicated ASR endpoint/key stay on DashScope/Qwen APIs.
+        self.asr_endpoint = os.getenv("QWEN_ENDPOINT", "").strip()
+        self.asr_api_key = os.getenv("QWEN_API_KEY", "").strip()
         self.speech_model = os.getenv("QWEN_SPEECH_MODEL", "").strip() or "qwen2.5-omni-7b"
         # ASR model for speech-to-text (DashScope uses paraformer models)
         self.asr_model = os.getenv("QWEN_ASR_MODEL", "paraformer-v2").strip()
@@ -177,12 +209,12 @@ class QwenClient:
         Uses the same endpoint as text chat, with audio sent via input_audio in messages.content.
         Requires streaming (stream=True) as per Qwen Omni requirements.
         """
-        if not self.endpoint or "chat/completions" not in self.endpoint:
+        if not self.asr_endpoint or "chat/completions" not in self.asr_endpoint:
             raise RuntimeError(
                 "QWEN_ENDPOINT must be the compatible-mode chat/completions endpoint. "
                 "Example: https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
             )
-        if not self.api_key:
+        if not self.asr_api_key:
             raise RuntimeError("QWEN_API_KEY not configured. Please set it to your DashScope API key.")
         
         print(f"DEBUG: Transcribing audio via Qwen Omni chat endpoint, model={self.speech_model}, size={len(audio_bytes)} bytes, mime={mime}")
@@ -193,7 +225,7 @@ class QwenClient:
         data_url = f"data:audio/{fmt};base64,{audio_b64}"
         
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {self.asr_api_key}",
             "Content-Type": "application/json",
         }
         
@@ -234,7 +266,7 @@ class QwenClient:
         text_chunks: List[str] = []
         async with httpx.AsyncClient(timeout=None) as client:
             try:
-                async with client.stream("POST", self.endpoint, headers=headers, json=payload) as resp:
+                async with client.stream("POST", self.asr_endpoint, headers=headers, json=payload) as resp:
                     print(f"DEBUG: Stream response status={resp.status_code}")
                     resp.raise_for_status()
                     
@@ -319,7 +351,7 @@ class QwenClient:
             )
         
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {self.asr_api_key}",
             "Content-Type": "application/json",
             "X-DashScope-Async": "enable"  # Required for async transcription
         }
@@ -400,7 +432,7 @@ class QwenClient:
                     await asyncio.sleep(poll_interval)
                     
                     # Query task status - DashScope uses /tasks/{task_id} endpoint
-                    status_headers = {"Authorization": f"Bearer {self.api_key}"}
+                    status_headers = {"Authorization": f"Bearer {self.asr_api_key}"}
                     # Construct status endpoint: replace /transcription with /tasks/{task_id}
                     base_url = endpoint.rsplit("/transcription", 1)[0] if "/transcription" in endpoint else endpoint.rsplit("/", 1)[0]
                     status_url = f"{base_url}/tasks/{task_id}"
@@ -741,12 +773,20 @@ class QwenClient:
         if not missing_field_ids:
             return ""
         # Read env at request time so .env loaded after worker start is picked up
-        endpoint = (os.getenv("QWEN_ENDPOINT") or "").strip() or self.endpoint
+        endpoint = (
+            (os.getenv("LOCAL_LLM_ENDPOINT") or "").strip()
+            or (os.getenv("QWEN_ENDPOINT") or "").strip()
+            or self.endpoint
+        )
         if not endpoint:
             raise RuntimeError("LLM endpoint not configured")
         if not self.endpoint and endpoint:
             self.endpoint = endpoint
-            self.api_key = (os.getenv("QWEN_API_KEY") or "").strip() or self.api_key
+            self.api_key = (
+                (os.getenv("LOCAL_LLM_API_KEY") or "").strip()
+                or (os.getenv("QWEN_API_KEY") or "").strip()
+                or self.api_key
+            )
         target = missing_field_ids[0]
 
         # Reply in same language as user message when lang is provided (normalize codes)
@@ -1277,12 +1317,12 @@ class QwenClient:
         """
         if not audio_bytes:
             raise ValueError("audio_bytes required")
-        base = (self.endpoint or "").strip()
+        base = (self.asr_endpoint or "").strip()
         if not base:
             raise RuntimeError(
                 "QWEN_ENDPOINT must be set to the compatible-mode endpoint (e.g. https://dashscope-intl.aliyuncs.com/compatible-mode/v1) for Qwen3-ASR."
             )
-        if not self.api_key:
+        if not self.asr_api_key:
             raise RuntimeError("QWEN_API_KEY not configured.")
 
         endpoint = base if "chat/completions" in base else base.rstrip("/") + "/chat/completions"
@@ -1315,7 +1355,7 @@ class QwenClient:
         payload["asr_options"] = asr_options
 
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {self.asr_api_key}",
             "Content-Type": "application/json",
         }
         _log.debug(

@@ -52,9 +52,20 @@ def create_app() -> FastAPI:
     def env_check():
         """Check if LLM env vars are loaded (no secrets)."""
         import os
-        ep = (os.getenv("QWEN_ENDPOINT") or "").strip()
-        key_set = bool((os.getenv("QWEN_API_KEY") or "").strip())
-        return {"qwen_endpoint_configured": bool(ep), "qwen_api_key_set": key_set, "llm_ok": bool(ep) and key_set}
+        local_ep = (os.getenv("LOCAL_LLM_ENDPOINT") or "").strip()
+        local_key_set = bool((os.getenv("LOCAL_LLM_API_KEY") or "").strip())
+        qwen_ep = (os.getenv("QWEN_ENDPOINT") or "").strip()
+        qwen_key_set = bool((os.getenv("QWEN_API_KEY") or "").strip())
+        return {
+            "local_llm_endpoint_configured": bool(local_ep),
+            "local_llm_api_key_set": local_key_set,
+            "qwen_endpoint_configured": bool(qwen_ep),
+            "qwen_api_key_set": qwen_key_set,
+            # Reasoning can run with LOCAL_LLM_ENDPOINT (key may be optional for local servers).
+            "llm_ok": bool(local_ep or qwen_ep),
+            # ASR requires both QWEN endpoint and key.
+            "asr_ok": bool(qwen_ep) and qwen_key_set,
+        }
 
     return app
 

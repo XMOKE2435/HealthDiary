@@ -26,9 +26,14 @@ Endpoints (demo stubs)
 
 Contracts per docs/docs/ARCHITECTURE.md (mock analytics/ASR/LLM for demo purposes).
 
-LLM (optional)
-  - Set env vars if you have a hosted Qwen endpoint:
-    - QWEN_ENDPOINT=https://your-qwen-endpoint
-    - QWEN_API_KEY=your_token
-  - Without these, the server returns safe heuristics for demo.
+LLM / ASR configuration
+  - Reasoning/chat (diary, recommendations, summaries) can run on your Pi local model:
+    - LOCAL_LLM_ENDPOINT=http://<pi-ip>:8080/v1/chat/completions
+    - LOCAL_LLM_MODEL=qwen2.5-1.5b-instruct-q4_k_m.gguf (or your served model id)
+    - LOCAL_LLM_API_KEY= (optional; leave empty if your local server has no auth)
+  - ASR stays on Qwen/DashScope:
+    - QWEN_ENDPOINT=https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+    - QWEN_API_KEY=your_dashscope_token
+  - Backward compatibility: if LOCAL_LLM_* is not set, reasoning falls back to QWEN_ENDPOINT.
+  - Without any endpoint vars, the server returns safe heuristics for demo.
 
