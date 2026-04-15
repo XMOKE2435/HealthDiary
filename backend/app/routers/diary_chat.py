@@ -76,6 +76,17 @@ def _normalize_reply_lang(req_lang: Optional[str], user_text: str) -> str:
     return _infer_lang_from_text(user_text)
 
 
+def _looks_chinese(text: str) -> bool:
+    t = unicodedata.normalize("NFKC", (text or "").strip())
+    if not t:
+        return False
+    cjk = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]")
+    latin = re.compile(r"[A-Za-z\uFF21-\uFF3A\uFF41-\uFF5A]")
+    cjk_count = sum(1 for ch in t if cjk.match(ch))
+    en_count = sum(1 for ch in t if latin.match(ch))
+    return cjk_count > en_count
+
+
 # Saved-message text per language (for mixed-language chat)
 SAVED_MSG = {"en": "Thanks for sharing. I've saved this for you. I hope you feel better soon.", "zh": "谢谢您的分享，我已经为您保存好了。祝您早日好起来。"}
 
@@ -244,6 +255,10 @@ async def diary_chat_step(req: ChatStepRequest):
         target = need[0]
         try:
             q_text = await llm.generate_question([target], merged, [m.model_dump() for m in req.messages], lang=reply_lang)
+            # Small local models can sometimes ignore language lock with mixed-language history.
+            # If we expect English but output is still Chinese-dominant, force canonical English.
+            if reply_lang == "en" and _looks_chinese(q_text):
+                q_text = await llm.canonicalize_to_english(q_text)
         except RuntimeError as e:
             if "not configured" in str(e).lower():
                 raise HTTPException(
