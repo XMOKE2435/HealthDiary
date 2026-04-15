@@ -59,16 +59,25 @@ Recommended for natural voice (Piper):
 sudo apt install -y piper
 ```
 
-Then set model paths in environment (for example in `~/.bashrc` on Pi):
+Then set model paths once using either:
+
+### A) `desktop_app/tts.env` (recommended on Pi touch terminals)
+
+Create `desktop_app/tts.env` next to `main.py`:
+
+```env
+HEALTHDAIRY_TTS_BACKEND=piper
+HEALTHDAIRY_TTS_PIPER_MODEL_EN=/home/xmoke/models/piper/en/en_US/lessac/medium/en_US-lessac-medium.onnx
+HEALTHDAIRY_TTS_PIPER_MODEL_ZH=/home/xmoke/models/piper/zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx
+```
+
+The desktop app loads this file automatically on startup.
+
+### B) Shell exports (optional)
 
 ```bash
 export HEALTHDAIRY_TTS_PIPER_MODEL_EN=/home/pi/models/piper/en_US-lessac-medium.onnx
 export HEALTHDAIRY_TTS_PIPER_MODEL_ZH=/home/pi/models/piper/zh_CN-huayan-medium.onnx
-```
-
-Optional: force backend selection:
-
-```bash
 export HEALTHDAIRY_TTS_BACKEND=piper
 ```
 

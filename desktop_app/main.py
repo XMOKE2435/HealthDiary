@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import wave
+from pathlib import Path
 from datetime import date, datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -39,6 +40,45 @@ from PySide6.QtWidgets import (
 
 from api import BackendClient
 from companion_pool import load_question_pool, pick_question
+
+
+def load_desktop_tts_env() -> None:
+    """Load KEY=value pairs into os.environ so Pi touch terminals don't need ~/.bashrc.
+
+    Search order:
+    1) HEALTHDAIRY_TTS_ENV_FILE (explicit path)
+    2) <repo>/desktop_app/tts.env
+    3) ~/.config/healthdiary/tts.env
+
+    Later files do not override keys already set in the process environment.
+    """
+    paths: List[Path] = []
+    custom = (os.environ.get("HEALTHDAIRY_TTS_ENV_FILE") or "").strip()
+    if custom:
+        paths.append(Path(custom))
+    here = Path(__file__).resolve().parent
+    paths.append(here / "tts.env")
+    cfg_home = Path.home() / ".config" / "healthdiary" / "tts.env"
+    paths.append(cfg_home)
+
+    for p in paths:
+        if not p.is_file():
+            continue
+        try:
+            for raw in p.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip().strip("'\"")
+                if not k or k in os.environ:
+                    continue
+                os.environ[k] = v
+            print(f"[TTS] Loaded env from {p}", flush=True)
+        except OSError as e:
+            print(f"[TTS] Could not read {p}: {e}", flush=True)
 
 
 class TtsWorker:
@@ -138,8 +178,16 @@ class TtsWorker:
         if forced and forced != "piper":
             return False
         self._ensure_unix_path()
-        piper_bin = shutil.which("piper") or "/usr/local/bin/piper" or "/usr/bin/piper"
-        if not self._is_executable(piper_bin):
+        piper_bin = ""
+        for cand in (
+            shutil.which("piper") or "",
+            "/usr/bin/piper",
+            "/usr/local/bin/piper",
+        ):
+            if self._is_executable(cand):
+                piper_bin = cand
+                break
+        if not piper_bin:
             return False
         model_en, _ = self._resolve_piper_model("en")
         model_zh, _ = self._resolve_piper_model("zh")
@@ -152,6 +200,7 @@ class TtsWorker:
             )
             return False
         self._linux_tts_bin = piper_bin
+        print(f"[TTS] Piper binary resolved to {piper_bin}", flush=True)
         return True
 
     @staticmethod
@@ -241,11 +290,14 @@ class TtsWorker:
             proc = subprocess.Popen(
                 ["aplay", "-q", "-D", self._linux_playback_device, path],
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
             with self._active_lock:
                 self._active_proc = proc
-            proc.wait()
+            _, err = proc.communicate()
+            if proc.returncode != 0:
+                msg = (err or b"").decode("utf-8", errors="replace").strip()
+                raise RuntimeError(f"aplay failed (device {self._linux_playback_device!r}): {msg or proc.returncode}")
         finally:
             with self._active_lock:
                 if self._active_proc is proc:
@@ -324,14 +376,16 @@ class TtsWorker:
             if config_path and os.path.isfile(config_path):
                 cmd.extend(["--config", config_path])
             # Piper reads input text from stdin.
-            subprocess.run(
+            pr = subprocess.run(
                 cmd,
                 input=text.encode("utf-8", errors="replace"),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
-                check=True,
                 timeout=90,
             )
+            if pr.returncode != 0:
+                err = (pr.stderr or b"").decode("utf-8", errors="replace").strip()
+                raise RuntimeError(f"piper exited {pr.returncode}: {err}")
             self._play_wav_linux(wav_path)
         finally:
             try:
@@ -1935,6 +1989,7 @@ class MainWindow(QMainWindow):
             self._meal_analyze_btn.setEnabled(not busy)
 
 def main():
+    load_desktop_tts_env()
     app = QApplication(sys.argv)
     win = MainWindow()
     win.show()
