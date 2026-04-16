@@ -888,28 +888,14 @@ class MainWindow(QMainWindow):
         self._companion_master_cb.setChecked(False)
         self._companion_master_cb.toggled.connect(self._on_companion_master_toggled)
         outer.addWidget(self._companion_master_cb)
-
-        hint = QLabel(
-            "When enabled, the app may open the Symptom chat tab and send a warm bilingual hello "
-            "up to the number of times you choose. Each chat is limited to five exchanges, then gently ends.\n"
-            "开启后，应用会在“症状记录”里自动发起简短陪伴聊天（最多五轮来回），到点温和结束。"
-        )
-        hint.setWordWrap(True)
-        outer.addWidget(hint)
-
+        # Keep Companion tab compact on small Pi screens:
+        # instructions are omitted here so the schedule widgets have more vertical space.
         outer.addWidget(
             QLabel(
-                "After changing options below, click Save settings so they are stored.\n"
-                "修改下方选项后，请点击「保存设置」写入本机。"
+                "Enable if you want automatic companion check-ins. / "
+                "需要自动陪伴问候时请开启。"
             )
         )
-
-        pool_note = QLabel(
-            "Opening lines use the built-in bilingual question list (Singapore / seniors). / "
-            "问候语使用内置题库（本地 companion_questions.json）。"
-        )
-        pool_note.setWordWrap(True)
-        outer.addWidget(pool_note)
 
         sched_g = QGroupBox("Schedule / 时间安排")
         sched_l = QVBoxLayout(sched_g)
