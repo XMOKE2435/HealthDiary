@@ -18,6 +18,7 @@ import numpy as np
 import pyttsx3
 import sounddevice as sd
 from PySide6.QtCore import QObject, QSettings, QThread, QTime, QTimer, Signal
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -29,6 +30,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QSpinBox,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -41,6 +43,50 @@ from PySide6.QtWidgets import (
 
 from api import BackendClient
 from companion_pool import load_question_pool, pick_question
+
+
+class TouchTimeEdit(QWidget):
+    """Touch-friendly hour/minute editor using up/down spinners (no keyboard typing).
+
+    This replaces QTimeEdit for small Pi touch screens where the QTimeEdit keyboard
+    hides the rest of the UI.
+    """
+
+    def __init__(self, initial: QTime) -> None:
+        super().__init__()
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        self._hour = QSpinBox()
+        self._hour.setRange(0, 23)
+        self._hour.setButtonSymbols(QAbstractSpinBox.UpDownArrows)
+        # Touch-friendly: prevent keyboard typing, but keep arrows working.
+        self._hour.setKeyboardTracking(False)
+        self._hour.lineEdit().setReadOnly(True)
+        self._hour.lineEdit().setFocusPolicy(Qt.NoFocus)
+
+        self._minute = QSpinBox()
+        self._minute.setRange(0, 59)
+        self._minute.setButtonSymbols(QAbstractSpinBox.UpDownArrows)
+        self._minute.setKeyboardTracking(False)
+        self._minute.lineEdit().setReadOnly(True)
+        self._minute.lineEdit().setFocusPolicy(Qt.NoFocus)
+
+        layout.addWidget(self._hour)
+        layout.addWidget(QLabel(":"))
+        layout.addWidget(self._minute)
+
+        self.setTime(initial)
+
+    def time(self) -> QTime:
+        return QTime(self._hour.value(), self._minute.value())
+
+    def setTime(self, t: QTime) -> None:
+        if not isinstance(t, QTime) or not t.isValid():
+            return
+        self._hour.setValue(t.hour())
+        self._minute.setValue(t.minute())
 
 
 def _infer_lang_from_text(text: str) -> str:
@@ -911,35 +957,23 @@ class MainWindow(QMainWindow):
 
         win_row = QHBoxLayout()
         win_row.addWidget(QLabel("Random time window / 随机时段："))
-        self._companion_win_start = QTimeEdit()
-        self._companion_win_start.setDisplayFormat("HH:mm")
-        self._companion_win_start.setTime(QTime(9, 0))
-        # Touch-friendly: show up/down arrows for time adjustment.
-        self._companion_win_start.setButtonSymbols(QAbstractSpinBox.UpDownArrows)
+        self._companion_win_start = TouchTimeEdit(QTime(9, 0))
         win_row.addWidget(self._companion_win_start)
         win_row.addWidget(QLabel("–"))
-        self._companion_win_end = QTimeEdit()
-        self._companion_win_end.setDisplayFormat("HH:mm")
-        self._companion_win_end.setTime(QTime(21, 0))
-        # Touch-friendly: show up/down arrows for time adjustment.
-        self._companion_win_end.setButtonSymbols(QAbstractSpinBox.UpDownArrows)
+        self._companion_win_end = TouchTimeEdit(QTime(21, 0))
         win_row.addWidget(self._companion_win_end)
         win_row.addStretch()
         sched_l.addLayout(win_row)
 
         self._companion_random_chk: List[QCheckBox] = []
-        self._companion_time_edits: List[QTimeEdit] = []
+        self._companion_time_edits: List[QWidget] = []
         for i in range(3):
             g2 = QGroupBox(f"Check-in {i + 1} / 第 {i + 1} 次")
             f2 = QFormLayout(g2)
             rb = QCheckBox("Use random time in window above / 在上面时段内随机")
             rb.setChecked(True)
             self._companion_random_chk.append(rb)
-            te = QTimeEdit()
-            te.setDisplayFormat("HH:mm")
-            te.setTime(QTime(10 + i * 4, 0))
-            # Touch-friendly: show up/down arrows for time adjustment.
-            te.setButtonSymbols(QAbstractSpinBox.UpDownArrows)
+            te = TouchTimeEdit(QTime(10 + i * 4, 0))
             self._companion_time_edits.append(te)
             f2.addRow(rb)
             f2.addRow("Fixed time / 固定时间：", te)
