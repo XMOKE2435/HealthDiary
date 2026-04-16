@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QAbstractSpinBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -913,11 +914,15 @@ class MainWindow(QMainWindow):
         self._companion_win_start = QTimeEdit()
         self._companion_win_start.setDisplayFormat("HH:mm")
         self._companion_win_start.setTime(QTime(9, 0))
+        # Touch-friendly: show up/down arrows for time adjustment.
+        self._companion_win_start.setButtonSymbols(QAbstractSpinBox.UpDownArrows)
         win_row.addWidget(self._companion_win_start)
         win_row.addWidget(QLabel("–"))
         self._companion_win_end = QTimeEdit()
         self._companion_win_end.setDisplayFormat("HH:mm")
         self._companion_win_end.setTime(QTime(21, 0))
+        # Touch-friendly: show up/down arrows for time adjustment.
+        self._companion_win_end.setButtonSymbols(QAbstractSpinBox.UpDownArrows)
         win_row.addWidget(self._companion_win_end)
         win_row.addStretch()
         sched_l.addLayout(win_row)
@@ -933,6 +938,8 @@ class MainWindow(QMainWindow):
             te = QTimeEdit()
             te.setDisplayFormat("HH:mm")
             te.setTime(QTime(10 + i * 4, 0))
+            # Touch-friendly: show up/down arrows for time adjustment.
+            te.setButtonSymbols(QAbstractSpinBox.UpDownArrows)
             self._companion_time_edits.append(te)
             f2.addRow(rb)
             f2.addRow("Fixed time / 固定时间：", te)
