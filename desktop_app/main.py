@@ -937,19 +937,14 @@ class MainWindow(QMainWindow):
         outer.addWidget(self._companion_master_cb)
         # Keep Companion tab compact on small Pi screens:
         # instructions are omitted here so the schedule widgets have more vertical space.
-        outer.addWidget(
-            QLabel(
-                "Enable if you want automatic companion check-ins. / "
-                "需要自动陪伴问候时请开启。"
-            )
-        )
+        # (Intentionally no extra instruction label here on Pi touch screens to save space.)
 
         sched_g = QGroupBox("Schedule / 时间安排")
         sched_l = QVBoxLayout(sched_g)
         row_count = QHBoxLayout()
-        row_count.addWidget(QLabel("Check-ins per day (max 3) / 每天次数："))
+        row_count.addWidget(QLabel("Check-ins per day (max 2) / 每天次数："))
         self._companion_num = QComboBox()
-        self._companion_num.addItems(["1", "2", "3"])
+        self._companion_num.addItems(["1", "2"])
         self._companion_num.setCurrentIndex(0)
         row_count.addWidget(self._companion_num)
         row_count.addStretch()
@@ -967,7 +962,7 @@ class MainWindow(QMainWindow):
 
         self._companion_random_chk: List[QCheckBox] = []
         self._companion_time_edits: List[QWidget] = []
-        for i in range(3):
+        for i in range(2):
             g2 = QGroupBox(f"Check-in {i + 1} / 第 {i + 1} 次")
             f2 = QFormLayout(g2)
             rb = QCheckBox("Use random time in window above / 在上面时段内随机")
@@ -1010,7 +1005,7 @@ class MainWindow(QMainWindow):
         on = self._companion_master_cb.isChecked()
         for cw in self._companion_cfg_widgets:
             cw.setEnabled(on)
-        for i in range(3):
+        for i in range(2):
             if on:
                 fixed_enable = not self._companion_random_chk[i].isChecked()
                 self._companion_time_edits[i].setEnabled(fixed_enable)
@@ -1023,7 +1018,7 @@ class MainWindow(QMainWindow):
         s.setValue("companion_num", self._companion_num.currentIndex() + 1)
         s.setValue("companion_win_start", self._companion_win_start.time().toString("HH:mm"))
         s.setValue("companion_win_end", self._companion_win_end.time().toString("HH:mm"))
-        for i in range(3):
+        for i in range(2):
             s.setValue(f"companion_slot{i}_random", self._companion_random_chk[i].isChecked())
             s.setValue(f"companion_slot{i}_time", self._companion_time_edits[i].time().toString("HH:mm"))
         s.sync()
@@ -1043,15 +1038,15 @@ class MainWindow(QMainWindow):
             # Start OFF on each app launch; user enables manually for current session.
             self._companion_master_cb.setChecked(False)
             n = int(s.value("companion_num", 1))
-            self._companion_num.setCurrentIndex(max(0, min(2, n - 1)))
+            self._companion_num.setCurrentIndex(max(0, min(1, n - 1)))
             ws = s.value("companion_win_start", "09:00")
             we = s.value("companion_win_end", "21:00")
             if isinstance(ws, str) and QTime.fromString(ws, "HH:mm").isValid():
                 self._companion_win_start.setTime(QTime.fromString(ws, "HH:mm"))
             if isinstance(we, str) and QTime.fromString(we, "HH:mm").isValid():
                 self._companion_win_end.setTime(QTime.fromString(we, "HH:mm"))
-            defaults = ("10:00", "14:00", "18:00")
-            for i in range(3):
+            defaults = ("10:00", "14:00")
+            for i in range(2):
                 r = s.value(f"companion_slot{i}_random", True)
                 self._companion_random_chk[i].setChecked(bool(r))
                 tt = s.value(f"companion_slot{i}_time", defaults[i])
