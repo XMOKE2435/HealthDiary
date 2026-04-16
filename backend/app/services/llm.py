@@ -521,6 +521,11 @@ class QwenClient:
                 payload["response_format"] = {"type": response_format}
             async with httpx.AsyncClient(timeout=self.chat_timeout_sec) as client:
                 r = await client.post(self.endpoint, headers=headers, json=payload)
+                # Local OpenAI-compatible servers (e.g., some llama.cpp builds)
+                # may reject response_format with HTTP 400. Retry once without it.
+                if r.status_code == 400 and "response_format" in payload:
+                    payload.pop("response_format", None)
+                    r = await client.post(self.endpoint, headers=headers, json=payload)
                 r.raise_for_status()
                 data = r.json()
                 try:
