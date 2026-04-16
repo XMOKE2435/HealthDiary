@@ -1013,7 +1013,8 @@ class MainWindow(QMainWindow):
         s = QSettings("HealthDairy", "HealthDairy")
         self._companion_master_cb.blockSignals(True)
         try:
-            self._companion_master_cb.setChecked(bool(s.value("companion_enabled", False)))
+            # Start OFF on each app launch; user enables manually for current session.
+            self._companion_master_cb.setChecked(False)
             n = int(s.value("companion_num", 1))
             self._companion_num.setCurrentIndex(max(0, min(2, n - 1)))
             ws = s.value("companion_win_start", "09:00")
@@ -1084,6 +1085,12 @@ class MainWindow(QMainWindow):
             adjusted.append((slot_i, mm))
             last = mm
         self._companion_schedule = adjusted
+        # Skip missed slots at app launch/day reset (no immediate catch-up).
+        now = datetime.now().time()
+        now_m = now.hour * 60 + now.minute
+        for slot_i, target_m in self._companion_schedule:
+            if target_m < now_m:
+                self._companion_fired_slots.add(slot_i)
 
     def _companion_timer_tick(self) -> None:
         if not self._companion_master_cb.isChecked():
