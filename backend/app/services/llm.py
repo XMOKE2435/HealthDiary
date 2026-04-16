@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import ast
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Literal
 
@@ -884,12 +885,56 @@ class QwenClient:
         out = await self._post_chat([sys_msg] + extra + conv, temperature=0.55)
         return (out or mock_heart[-1]).strip()
 
-    async def recommend_from_entries(self, entries: List[Dict[str, Any]], window_days: int) -> List[Dict[str, Any]]:
+    async def recommend_from_entries(
+        self,
+        entries: List[Dict[str, Any]],
+        window_days: int,
+        lang: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """Analyze past entries and return non-medical recommendations with evidence pointers.
         Uses LLM to interpret patterns if endpoint available; otherwise heuristic fallback.
         """
         if not entries:
             return []
+        async def _normalize_bilingual_suggestions(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            out: List[Dict[str, Any]] = []
+            for s in items:
+                if not isinstance(s, dict):
+                    continue
+                en = (s.get("text_english") or s.get("text_en") or "").strip()
+                zh = (s.get("text_chinese") or s.get("text_zh") or "").strip()
+                base = (s.get("text") or "").strip()
+                if not en and not zh and base:
+                    # If upstream returned one language only, keep compatibility in both slots.
+                    en = base
+                if not zh and en and self.endpoint:
+                    try:
+                        tr = await self._post_chat(
+                            [
+                                {
+                                    "role": "system",
+                                    "content": "Translate to concise Simplified Chinese for older adults. Output only Chinese text.",
+                                },
+                                {"role": "user", "content": en},
+                            ],
+                            temperature=0.1,
+                        )
+                        zh = (tr or "").strip()
+                    except Exception:
+                        zh = ""
+                if not zh and en:
+                    zh = "请继续观察并记录症状变化。"
+                if not base:
+                    if en and zh:
+                        base = f"EN: {en}\n中文: {zh}"
+                    else:
+                        base = en or zh
+                s["text_english"] = en
+                s["text_chinese"] = zh
+                s["text"] = base
+                out.append(s)
+            return out
+
         if not self.endpoint:
             # Fallback: simple rule-based
             suggestions = []
@@ -898,10 +943,19 @@ class QwenClient:
             fields = last.get("fields", {}) or {}
             if fields.get("severity") and fields.get("severity") >= 7:
                 suggestions.append({
-                    "text": "Your recent entries show higher severity. Consider preparing a Doctor Pack.",
+                    "text": "EN: Your recent entries show higher severity. Consider preparing a Doctor Pack.\n中文: 您最近的记录显示症状较重，建议准备就诊摘要并尽快就医咨询。",
+                    "text_english": "Your recent entries show higher severity. Consider preparing a Doctor Pack.",
+                    "text_chinese": "您最近的记录显示症状较重，建议准备就诊摘要并尽快就医咨询。",
                     "evidence": [f"entry_id:{last_id}", "feature:severity_high"]
                 })
-            return suggestions if suggestions else [{"text": "Continue monitoring symptoms.", "evidence": [f"entry_id:{last_id}"]}]
+            if not suggestions:
+                suggestions = [{
+                    "text": "EN: Continue monitoring symptoms.\n中文: 请继续观察并记录症状变化。",
+                    "text_english": "Continue monitoring symptoms.",
+                    "text_chinese": "请继续观察并记录症状变化。",
+                    "evidence": [f"entry_id:{last_id}"],
+                }]
+            return suggestions
 
         # Build a detailed summary of entries for LLM analysis
         summary_lines = []
@@ -918,13 +972,22 @@ class QwenClient:
         labels = [((e.get('fields') or {}).get('symptom_label') or '').lower() for e in entries]
         top_labels = [l for l in {l for l in labels if l}]
         entry_text = "\n".join(summary_lines)
-        mode = get_current_language_mode()
-        lang_note = "Respond in English only, using simple language for older adults." if mode == LanguageMode.ENGLISH else "只用简体中文回答，用适合年长者的简单表达方式。"
+        lc = (lang or "").strip().lower()
+        if lc.startswith("zh"):
+            mode = LanguageMode.CHINESE
+        elif lc.startswith("en"):
+            mode = LanguageMode.ENGLISH
+        else:
+            mode = get_current_language_mode()
+        lang_note = "Use simple language suitable for older adults."
         sys = {
             "role": "system",
             "content": (
-                "You analyze patient diary entries and produce detailed, professional non-medical recommendations. Output strict JSON array (3-5 items), each object: "
-                '{"text": "detailed recommendation paragraph (2-3 sentences explaining what to do, why based on patterns, and how to track)", "evidence": ["entry_id:..."]}. '
+                "You analyze patient diary entries and produce detailed, professional non-medical recommendations. "
+                "Output strict JSON array (3-5 items), each object: "
+                '{"text_english": "detailed recommendation paragraph (2-3 sentences)", '
+                '"text_chinese": "对应的简体中文建议（2-3句）", '
+                '"evidence": ["entry_id:..."]}. '
                 "Rules: no diagnosis or medication advice; be detailed and professional; tailor to symptom categories observed; "
                 "explain patterns (frequency, timing, triggers, severity trends); provide actionable next steps; "
                 "always include at least one evidence token entry_id:* from provided entries; avoid generic one-liners; use clear, patient-friendly language. "
@@ -938,14 +1001,20 @@ class QwenClient:
                 f"Symptom categories observed: {', '.join(top_labels) or 'n/a'}.\n"
                 f"Total entries: {len(entries)}.\n"
                 f"Detailed entries:\n{entry_text}\n\n"
-                "Return a JSON array of 3-5 detailed, professional recommendations. Each recommendation should be 2-3 sentences explaining what to monitor/track, why (based on patterns observed), and how to do it."
+                "Return a JSON array of 3-5 bilingual recommendations. "
+                "Each item must include text_english and text_chinese with equivalent meaning."
             ),
         }
         try:
             content = await self._post_chat([sys, user], response_format="json_object")
         except Exception as exc:
             _log.warning("recommend_from_entries LLM call failed; using fallback: %s", exc)
-            return [{"text": "Continue monitoring symptoms.", "evidence": [f"entry_id:{entries[-1].get('id')}"]}]
+            return [{
+                "text": "EN: Continue monitoring symptoms.\n中文: 请继续观察并记录症状变化。",
+                "text_english": "Continue monitoring symptoms.",
+                "text_chinese": "请继续观察并记录症状变化。",
+                "evidence": [f"entry_id:{entries[-1].get('id')}"],
+            }]
         try:
             obj = json.loads(content)
             if isinstance(obj, list):
@@ -956,7 +1025,7 @@ class QwenClient:
                     if not ev and entries:
                         ev = [f"entry_id:{entries[-1].get('id')}"]
                     s['evidence'] = ev
-                return obj
+                return await _normalize_bilingual_suggestions(obj)
             if isinstance(obj, dict) and "suggestions" in obj:
                 valid_ids = {e.get('id') for e in entries}
                 out = []
@@ -966,11 +1035,16 @@ class QwenClient:
                         ev = [f"entry_id:{entries[-1].get('id')}"]
                     s['evidence'] = ev
                     out.append(s)
-                return out
+                return await _normalize_bilingual_suggestions(out)
         except Exception:
             pass
         # Fallback
-        return [{"text": "Continue monitoring symptoms.", "evidence": [f"entry_id:{entries[-1].get('id')}"]}]
+        return [{
+            "text": "EN: Continue monitoring symptoms.\n中文: 请继续观察并记录症状变化。",
+            "text_english": "Continue monitoring symptoms.",
+            "text_chinese": "请继续观察并记录症状变化。",
+            "evidence": [f"entry_id:{entries[-1].get('id')}"],
+        }]
 
     async def summarize_doctor_pack(self, entries: List[Dict[str, Any]], window_days: int) -> Dict[str, Any]:
         """Create a bilingual doctor pack summary from diary entries.
@@ -1108,16 +1182,59 @@ class QwenClient:
                     ]
                     return out
 
+                def normalize_source_labels(raw: Any, fallback_label: str) -> List[str]:
+                    """
+                    Normalize LLM `source_labels` into a clean list[str].
+                    Handles:
+                    - proper arrays: ["abdominal pain", "stomach ache"]
+                    - comma text: "abdominal pain, stomach ache"
+                    - python-literal text: "['abdominal pain','stomach ache']"
+                    """
+                    vals: List[str] = []
+                    if isinstance(raw, list):
+                        vals = [str(x).strip().lower() for x in raw if str(x).strip()]
+                    elif isinstance(raw, str):
+                        s = raw.strip()
+                        if s:
+                            parsed: Any = None
+                            # Try JSON first
+                            try:
+                                parsed = json.loads(s)
+                            except Exception:
+                                parsed = None
+                            # Then Python literal list form
+                            if parsed is None:
+                                try:
+                                    parsed = ast.literal_eval(s)
+                                except Exception:
+                                    parsed = None
+                            if isinstance(parsed, list):
+                                vals = [str(x).strip().lower() for x in parsed if str(x).strip()]
+                            else:
+                                vals = [x.strip().lower() for x in s.split(",") if x.strip()]
+
+                    if not vals:
+                        vals = [fallback_label.strip().lower()]
+                    # keep order, remove duplicates
+                    dedup: List[str] = []
+                    seen = set()
+                    for v in vals:
+                        if v not in seen:
+                            seen.add(v)
+                            dedup.append(v)
+                    return dedup
+
                 # Merge LLM summaries with actual dates: collect dates from all source_labels
                 final_groups: List[Dict[str, Any]] = []
                 for g in raw_groups:
                     if not isinstance(g, dict):
                         continue
-                    source_labels = g.get("source_labels") or []
-                    if not source_labels and g.get("symptom_label"):
-                        source_labels = [(g.get("symptom_label") or "symptom").lower()]
-                    if not source_labels:
-                        source_labels = list(groups_by_label.keys())[:1]
+                    fallback_label = (
+                        g.get("symptom_label")
+                        or g.get("symptom_label_english")
+                        or "symptom"
+                    )
+                    source_labels = normalize_source_labels(g.get("source_labels"), str(fallback_label))
                     all_dates = []
                     all_entry_ids = []
                     for sl in source_labels:
@@ -1126,10 +1243,17 @@ class QwenClient:
                             all_dates.extend(groups_by_label[key]["dates"])
                             all_entry_ids.extend(groups_by_label[key]["entry_ids"])
                     all_dates = sorted(set(all_dates))
+                    if not all_dates:
+                        # If LLM labels don't match canonical keys, fallback to the best available key.
+                        fallback_key = str(fallback_label).strip().lower()
+                        if fallback_key in groups_by_label:
+                            all_dates = sorted(set(groups_by_label[fallback_key]["dates"]))
+                            all_entry_ids.extend(groups_by_label[fallback_key]["entry_ids"])
                     final_groups.append({
                         "symptom_label": (g.get("symptom_label") or g.get("symptom_label_english") or "symptom").lower(),
                         "symptom_label_english": g.get("symptom_label_english") or g.get("symptom_label", "Symptom"),
                         "symptom_label_chinese": g.get("symptom_label_chinese") or "",
+                        "source_labels": [str(sl).lower() for sl in source_labels],
                         "summary": g.get("summary", ""),
                         "summary_english": g.get("summary_english") or g.get("summary", ""),
                         "summary_chinese": g.get("summary_chinese") or "",
@@ -1143,6 +1267,7 @@ class QwenClient:
                             "symptom_label": label,
                             "symptom_label_english": label.replace("_", " ").title(),
                             "symptom_label_chinese": "",
+                            "source_labels": [label],
                             "summary": f"Reported {len(data['entry_ids'])} times",
                             "summary_english": f"Reported {len(data['entry_ids'])} times",
                             "summary_chinese": f"本周期内记录 {len(data['entry_ids'])} 次。",
@@ -1186,6 +1311,7 @@ class QwenClient:
                 "symptom_label": label,
                 "symptom_label_english": en_title,
                 "symptom_label_chinese": "",
+                "source_labels": [label],
                 "summary": f"Reported {len(data['entry_ids'])} times",
                 "summary_english": f"Reported {len(data['entry_ids'])} times",
                 "summary_chinese": f"本周期内记录 {len(data['entry_ids'])} 次。",

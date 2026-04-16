@@ -323,7 +323,16 @@ def demo_home(request: Request):
 
             async function getRecs(){
               const userId = document.getElementById('userId').value;
-              const r = await fetch(`/recommendations?user_id=${encodeURIComponent(userId)}&window_days=30&label=abdominal%20pain`);
+              // Prefer last explicit lang, otherwise infer from latest user chat message.
+              let recLang = (window._lastChatLang === 'zh') ? 'zh' : 'en';
+              try{
+                const msgs = (window._chat && Array.isArray(window._chat.messages)) ? window._chat.messages : [];
+                const latestUser = [...msgs].reverse().find(m => m && m.role === 'user' && m.text);
+                if(latestUser && /[\u4e00-\u9fff]/.test(latestUser.text)){
+                  recLang = 'zh';
+                }
+              }catch(_e){}
+              const r = await fetch(`/recommendations?user_id=${encodeURIComponent(userId)}&window_days=30&label=abdominal%20pain&lang=${encodeURIComponent(recLang)}`);
               const j = await r.json();
               document.getElementById('recsOut').innerText = JSON.stringify(j, null, 2);
               const spoken = Array.isArray(j.suggestions)

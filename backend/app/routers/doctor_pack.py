@@ -78,6 +78,41 @@ def post_doctor_pack(req: DoctorPackRequest):
     english_summary = summary.get("english_summary", "") or ""
     chinese_summary = summary.get("chinese_summary", "") or ""
 
+    # Build a full symptom timeline (exact datetime) for presentation and doctor review.
+    timeline_rows = []
+    symptom_timeline = []
+    for e in sorted(entries, key=lambda x: x.get("ts", ""), reverse=True):
+        fields = e.get("fields", {}) or {}
+        ts_raw = e.get("ts", "") or ""
+        try:
+            ts_fmt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            ts_fmt = ts_raw
+        label = (fields.get("symptom_label") or "symptom").replace("_", " ").title()
+        severity = fields.get("severity")
+        location = fields.get("location") or ""
+        char = fields.get("character") or ""
+        symptom_timeline.append(
+            {
+                "id": e.get("id", ""),
+                "ts": ts_raw,
+                "symptom_label": (fields.get("symptom_label") or "symptom"),
+                "severity": severity,
+                "location": location,
+                "character": char,
+                "symptom_raw": e.get("symptom_raw", ""),
+            }
+        )
+        timeline_rows.append(
+            f"<tr>"
+            f"<td>{ts_fmt}</td>"
+            f"<td>{label}</td>"
+            f"<td>{severity if severity is not None else '—'}</td>"
+            f"<td>{location or '—'}</td>"
+            f"<td>{char or '—'}</td>"
+            f"</tr>"
+        )
+
     html_content = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -92,6 +127,9 @@ def post_doctor_pack(req: DoctorPackRequest):
     .summary {{ margin:8px 0; color:#333; }}
     ul {{ margin-top:6px; }}
     .intro {{ background:#e8f4f8; padding:12px; border-radius:4px; margin-bottom:20px; }}
+    table {{ border-collapse: collapse; width: 100%; margin-top: 8px; }}
+    th, td {{ border: 1px solid #d7d7d7; padding: 8px; text-align: left; font-size: 14px; }}
+    th {{ background: #f3f7fb; }}
   </style>
 </head>
 <body>
@@ -154,9 +192,7 @@ def post_doctor_pack(req: DoctorPackRequest):
                     norm_dates.append(s[:10])
             summary_en = g.get("summary_english") or g.get("summary", "")
             summary_zh = g.get("summary_chinese") or ""
-            dates_str = ", ".join(sorted(set(norm_dates))[:10])
-            if len(norm_dates) > 10:
-                dates_str += f", ... ({len(norm_dates)} total dates)"
+            dates_str = ", ".join(sorted(set(norm_dates)))
             html_content += f"""  <div class="symptom-group">
     <div class="symptom-label">{title_display}</div>
     <div class="dates"><strong>Occurred on / 发生日期:</strong> {dates_str if dates_str else "No dates available / 无"}</div>
@@ -176,6 +212,24 @@ def post_doctor_pack(req: DoctorPackRequest):
     if not summary.get("suggestions"):
         html_content += "    <li><strong>EN:</strong> Continue monitoring and keep brief notes on triggers/relief. &nbsp; <strong>中文:</strong> 继续观察并简要记录诱因与缓解方式。</li>\n"
     html_content += "  </ul>\n"
+    html_content += f"""  <h2>Detailed Symptom Timeline (All Entries)</h2>
+  <p><strong>Showing {len(timeline_rows)} symptom records with exact date/time.</strong><br/>
+     <span>显示全部 {len(timeline_rows)} 条症状记录（含准确日期与时间）。</span></p>
+  <table>
+    <thead>
+      <tr>
+        <th>Date & Time</th>
+        <th>Symptom</th>
+        <th>Severity (0-10)</th>
+        <th>Location</th>
+        <th>Character</th>
+      </tr>
+    </thead>
+    <tbody>
+      {"".join(timeline_rows) if timeline_rows else "<tr><td colspan='5'>No records / 无记录</td></tr>"}
+    </tbody>
+  </table>
+"""
 
     html_content += """</body>
 </html>"""
@@ -190,11 +244,16 @@ def post_doctor_pack(req: DoctorPackRequest):
     return {
         "pdf_uri": f"/doctor-pack/pdf/{pdf_name}",
         "fhir": None,
-        "provenance": [f"entry_id:{e.get('id')}" for e in entries[-30:]],
+        "provenance": [f"entry_id:{e.get('id')}" for e in entries],
         "share_token": share_token,
         # Expose bilingual summaries so UI can render/toggle as needed
         "english_summary": english_summary,
         "chinese_summary": chinese_summary,
+        # Needed by desktop app to render grouped symptom view.
+        "symptom_groups": summary.get("symptom_groups", []) or [],
+        "suggestions": summary.get("suggestions", []) or [],
+        "entry_count": len(entries),
+        "symptom_timeline": symptom_timeline,
     }
 
 

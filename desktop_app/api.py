@@ -88,11 +88,14 @@ class BackendClient:
         user_id: str,
         window_days: int = 30,
         label: Optional[str] = None,
+        lang: Optional[str] = None,
     ) -> Dict[str, Any]:
         """GET /recommendations"""
         params = {"user_id": user_id, "window_days": window_days}
         if label:
             params["label"] = label
+        if lang:
+            params["lang"] = lang
         return self._get("/recommendations", params=params)
 
     def doctor_pack(

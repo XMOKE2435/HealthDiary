@@ -42,6 +42,17 @@ from api import BackendClient
 from companion_pool import load_question_pool, pick_question
 
 
+def _infer_lang_from_text(text: str) -> str:
+    t = (text or "").strip()
+    if not t:
+        return "en"
+    cjk_count = sum(1 for ch in t if "\u4e00" <= ch <= "\u9fff")
+    latin_count = sum(1 for ch in t if ("A" <= ch <= "Z") or ("a" <= ch <= "z"))
+    if cjk_count > latin_count:
+        return "zh"
+    return "en"
+
+
 def load_desktop_tts_env() -> None:
     """Load KEY=value pairs into os.environ so Pi touch terminals don't need ~/.bashrc.
 
@@ -1587,18 +1598,43 @@ class MainWindow(QMainWindow):
         self._set_busy(True)
         url = self._backend_edit.text().strip()
         user_id = self._user_edit.text().strip() or "demo-user-1"
+        latest_user_text = ""
+        for m in reversed(self._messages):
+            if (m.get("role") or "") == "user":
+                latest_user_text = m.get("text", "") or ""
+                break
+        rec_lang = _infer_lang_from_text(latest_user_text)
 
         def fn():
             c = BackendClient(url)
-            return c.recommendations(user_id=user_id, window_days=30)
+            return c.recommendations(user_id=user_id, window_days=30, lang=rec_lang)
 
         def on_ok(result):
             self._set_busy(False)
             suggestions = result.get("suggestions") or []
-            lines = [s.get("text", str(s)) for s in suggestions]
+            lines = []
+            for s in suggestions:
+                if not isinstance(s, dict):
+                    lines.append(str(s))
+                    continue
+                en = (s.get("text_english") or "").strip()
+                zh = (s.get("text_chinese") or "").strip()
+                txt = (s.get("text") or "").strip()
+                if en or zh:
+                    if en:
+                        lines.append(f"EN: {en}")
+                    if zh:
+                        lines.append(f"中文: {zh}")
+                    lines.append("")
+                else:
+                    lines.append(txt or str(s))
             self._recs_text.setPlainText("\n".join(lines) if lines else "(No suggestions)")
             spoken = ". ".join(
-                s.get("text") if isinstance(s, dict) and s.get("text") else str(s)
+                (
+                    f"{(s.get('text_english') or '').strip()}。{(s.get('text_chinese') or '').strip()}".strip("。")
+                    if isinstance(s, dict) and ((s.get("text_english") or s.get("text_chinese")))
+                    else (s.get("text") if isinstance(s, dict) and s.get("text") else str(s))
+                )
                 for s in suggestions
                 if s
             )
@@ -1629,6 +1665,8 @@ class MainWindow(QMainWindow):
         en = result.get("english_summary") or ""
         zh = result.get("chinese_summary") or ""
         groups = result.get("symptom_groups") or []
+        timeline = result.get("symptom_timeline") or []
+        entry_count = result.get("entry_count")
 
         lines: list[str] = []
         if en:
@@ -1647,12 +1685,17 @@ class MainWindow(QMainWindow):
                 label_zh = g.get("symptom_label_chinese") or ""
                 title = f"{label_en} / {label_zh}" if label_zh else label_en
                 lines.append(f"- {title}")
+                source_labels = g.get("source_labels") or []
+                if isinstance(source_labels, list) and source_labels:
+                    lines.append(f"  Merged labels / 合并来源: {', '.join(str(x) for x in source_labels if x)}")
                 dates = g.get("dates") or []
                 if not isinstance(dates, list):
                     dates = [dates]
-                dates_str = ", ".join(str(d) for d in dates if d)
-                if dates_str:
-                    lines.append(f"  Dates / 日期: {dates_str}")
+                clean_dates = [str(d) for d in dates if d]
+                if clean_dates:
+                    lines.append("  Dates / 日期:")
+                    for d in clean_dates:
+                        lines.append(f"    - {d}")
                 sum_en = g.get("summary_english") or g.get("summary", "") or ""
                 sum_zh = g.get("summary_chinese") or ""
                 if sum_en:
@@ -1662,6 +1705,25 @@ class MainWindow(QMainWindow):
                 lines.append("")
         else:
             lines.append("No symptom groups returned.\n本时间段内没有可用的症状分组。")
+
+        if timeline:
+            lines.append("")
+            if entry_count is not None:
+                lines.append(f"Detailed symptom timeline / 详细症状时间线（共 {entry_count} 条）:")
+            else:
+                lines.append("Detailed symptom timeline / 详细症状时间线：")
+            for row in timeline:
+                ts = row.get("ts", "")
+                label = (row.get("symptom_label") or "symptom").replace("_", " ")
+                sev = row.get("severity")
+                loc = row.get("location") or "-"
+                char = row.get("character") or "-"
+                lines.append(
+                    f"- {ts} | {label} | severity={sev if sev is not None else '-'} | location={loc} | character={char}"
+                )
+        else:
+            lines.append("")
+            lines.append("No detailed timeline returned / 未返回详细时间线")
 
         self._pack_text.setPlainText("\n".join(lines))
 
