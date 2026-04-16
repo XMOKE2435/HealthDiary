@@ -193,6 +193,19 @@ class QwenClient:
         # Use a configurable chat timeout to avoid frequent read timeouts.
         self.chat_timeout_sec = float(os.getenv("LLM_CHAT_TIMEOUT_SEC", "60").strip() or "60")
 
+    def _small_local_model_mode(self) -> bool:
+        """Heuristic for prompt compaction on Pi-hosted small models."""
+        endpoint = (self.endpoint or "").lower()
+        model = (self.model or "").lower()
+        explicit = (os.getenv("LOCAL_LLM_SMALL_CONTEXT") or "").strip().lower()
+        if explicit in ("1", "true", "yes", "on"):
+            return True
+        if explicit in ("0", "false", "no", "off"):
+            return False
+        local_ep = any(h in endpoint for h in ("127.0.0.1", "localhost", "192.168.", "10.", "172.16."))
+        small_model = any(k in model for k in ("1.5b", "0.5b", "3b"))
+        return local_ep and small_model
+
     async def _post_json(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         if not self.endpoint:
             # Fallback mock if no endpoint configured
@@ -963,12 +976,15 @@ class QwenClient:
             return suggestions
 
         # Build a detailed summary of entries for LLM analysis
+        compact = self._small_local_model_mode()
+        max_entries = 16 if compact else 50
+        raw_limit = 40 if compact else 80
         summary_lines = []
-        for e in entries[-50:]:
+        for e in entries[-max_entries:]:
             fields = e.get('fields') or {}
             ts = e.get('ts', '')[:10]
             label = fields.get('symptom_label', '')
-            raw = e.get('symptom_raw', '')[:80]
+            raw = e.get('symptom_raw', '')[:raw_limit]
             sev = fields.get('severity')
             timing = fields.get('timing')
             triggers = fields.get('triggers') or []
@@ -1005,7 +1021,7 @@ class QwenClient:
                 f"Analyze the last {window_days} days of entries with detailed information:\n"
                 f"Symptom categories observed: {', '.join(top_labels) or 'n/a'}.\n"
                 f"Total entries: {len(entries)}.\n"
-                f"Detailed entries:\n{entry_text}\n\n"
+                f"Detailed entries (recent subset):\n{entry_text}\n\n"
                 "Return a JSON array of 3-5 bilingual recommendations. "
                 "Each item must include text_english and text_chinese with equivalent meaning."
             ),
@@ -1122,12 +1138,15 @@ class QwenClient:
             }
 
         # Build context with labels, dates, and key fields for LLM summary generation
+        compact = self._small_local_model_mode()
+        max_entries = 18 if compact else 50
+        raw_limit = 30 if compact else 60
         lines = []
-        for e in entries[-50:]:
+        for e in entries[-max_entries:]:
             fields = e.get("fields", {}) or {}
             label = fields.get("symptom_label") or "symptom"
             ts = e.get("ts", "")[:10]
-            raw = e.get("symptom_raw", "")[:60]
+            raw = e.get("symptom_raw", "")[:raw_limit]
             sev = fields.get("severity")
             timing = fields.get("timing")
             triggers = fields.get("triggers") or []
@@ -1156,13 +1175,16 @@ class QwenClient:
                 "Rules: same content in both languages. No diagnosis or medication advice."
             ),
         }
+        groups_json = json.dumps(groups_by_label, ensure_ascii=False)
+        if compact and len(groups_json) > 1800:
+            groups_json = groups_json[:1800] + " ... (truncated)"
         user = {
             "role": "user",
             "content": (
                 "Structured symptom/events data from diary entries:\n"
                 f"{ctx}\n\n"
                 "groups_by_label (use these keys in source_labels when merging):\n"
-                f"{json.dumps(groups_by_label, ensure_ascii=False)}\n\n"
+                f"{groups_json}\n\n"
                 "Return strict JSON with doctor_pack_english, doctor_pack_chinese, symptom_groups (with symptom_label_english, symptom_label_chinese, summary_english, summary_chinese, source_labels), and suggestions (with text_english, text_chinese)."
             ),
         }
